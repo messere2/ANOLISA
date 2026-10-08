@@ -61,14 +61,28 @@ def _reject_if_cwd_inside_workspace(workspace: str) -> Optional[str]:
     return None
 
 
-def _run_ws_ckpt_cmd(cmd: list) -> Tuple[bool, str]:
-    """Execute a ws-ckpt CLI command and return (success, output)."""
+def _run_ws_ckpt_cmd(cmd: list, combine_streams: bool = False) -> Tuple[bool, str]:
+    """Execute a ws-ckpt CLI command and return (success, output).
+
+    By default the output is stdout, falling back to stderr only when
+    stdout is empty — JSON-consuming configuration commands rely on
+    parsing stdout alone. ``combine_streams`` joins both streams instead:
+    operation tools such as the manual checkpoint print their material
+    outcome (e.g. a skipped checkpoint's reason) on stderr while stdout
+    only carries the timing line, mirroring how checkpoint_manager
+    combines the two.
+    """
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=DEFAULT_TIMEOUT_S,
             env={**os.environ, "WS_CKPT_AGENT_NAME": "hermes"},
         )
-        return result.returncode == 0, result.stdout.strip() or result.stderr.strip()
+        if combine_streams:
+            parts = [result.stdout.strip(), result.stderr.strip()]
+            output = "\n".join(p for p in parts if p)
+        else:
+            output = result.stdout.strip() or result.stderr.strip()
+        return result.returncode == 0, output
     except subprocess.TimeoutExpired:
         return False, f"Command timed out ({DEFAULT_TIMEOUT_S}s)"
     except FileNotFoundError:
@@ -660,7 +674,10 @@ def handle_ws_ckpt_checkpoint(args: Dict[str, Any], **_kwargs) -> str:
 
     cmd = ["ws-ckpt", "checkpoint", "-w", workspace, "-s", snapshot_id,
            "-m", message]
-    success, output = _run_ws_ckpt_cmd(cmd)
+    # Combine streams: the CLI prints an intentional skip's reason on
+    # stderr while stdout only carries the timing line — the caller must
+    # see why no snapshot was created (issue #6376).
+    success, output = _run_ws_ckpt_cmd(cmd, combine_streams=True)
     return _ok(output) if success else _err(output)
 
 

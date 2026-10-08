@@ -213,6 +213,41 @@ class TestRunWsCkptCmd:
         assert ok is False
         assert "boom" in output
 
+    @patch("hermes.tools.subprocess.run")
+    def test_combine_streams_appends_stderr_to_stdout(self, mock_run):
+        # An intentional skip: reason on stderr, timing on stdout.
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="Completed in 0.001s\n",
+            stderr="⚠ Empty workspace, no snapshot created.\n",
+        )
+        ok, output = _run_ws_ckpt_cmd(
+            ["ws-ckpt", "checkpoint"], combine_streams=True)
+        assert ok is True
+        assert output == (
+            "Completed in 0.001s\n⚠ Empty workspace, no snapshot created."
+        )
+
+    @patch("hermes.tools.subprocess.run")
+    def test_combine_streams_stdout_only_when_stderr_empty(self, mock_run):
+        # A normal created snapshot: output unchanged without stderr.
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="snapshot snap-1 created\n", stderr="")
+        ok, output = _run_ws_ckpt_cmd(
+            ["ws-ckpt", "checkpoint"], combine_streams=True)
+        assert ok is True
+        assert output == "snapshot snap-1 created"
+
+    @patch("hermes.tools.subprocess.run")
+    def test_default_keeps_stdout_only_contract(self, mock_run):
+        # JSON-consuming config commands must not see stderr mixed in.
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout='{"schema": "ws-ckpt-policy/v1"}\n',
+            stderr="warning: something cosmetic\n")
+        ok, output = _run_ws_ckpt_cmd(
+            ["ws-ckpt", "config", "-w", "/ws", "--format", "json"])
+        assert ok is True
+        assert output == '{"schema": "ws-ckpt-policy/v1"}'
+
 
 # ---------------------------------------------------------------------------
 # check_ws_ckpt_available
@@ -285,6 +320,22 @@ class TestHandlers:
             with patch("hermes.tools._reject_if_cwd_inside_workspace", return_value=None):
                 result = json.loads(handle_ws_ckpt_checkpoint({}))
         assert result["success"] is False
+
+    def test_checkpoint_keeps_skip_reason_with_timing(self):
+        """An intentional skip stays successful but its reason must survive
+        next to the timing line (issue #6376)."""
+        with patch("hermes.tools._resolve_workspace", return_value=("/ws", None)):
+            with patch("hermes.tools._reject_if_cwd_inside_workspace", return_value=None):
+                with patch("hermes.tools.subprocess.run") as mock_run:
+                    mock_run.return_value = MagicMock(
+                        returncode=0, stdout="Completed in 0.001s\n",
+                        stderr="\x1b[33m⚠ Empty workspace, no snapshot created.\x1b[0m\n",
+                    )
+                    result = json.loads(handle_ws_ckpt_checkpoint(
+                        {"id": "snap1", "workspace": "/ws"}))
+        assert result["success"] is True
+        assert "Empty workspace, no snapshot created." in result["output"]
+        assert "Completed in" in result["output"]
 
     def test_rollback_missing_target(self):
         result = json.loads(handle_ws_ckpt_rollback({}))
