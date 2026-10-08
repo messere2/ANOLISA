@@ -850,6 +850,12 @@ impl SkillFs {
                     reply.error(errno(&e));
                     return;
                 }
+                // A truncated nested manifest must re-parse into the store
+                // like the flat O_TRUNC branch above.
+                self.send_sync(SyncEvent::Reparse {
+                    skill_name: skill_name.clone(),
+                    source_path: physical.clone(),
+                });
                 self.observe_mutation(
                     &nested_id,
                     Some(Path::new("SKILL.md")),

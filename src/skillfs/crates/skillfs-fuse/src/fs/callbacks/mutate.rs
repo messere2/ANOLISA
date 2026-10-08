@@ -1373,6 +1373,32 @@ impl SkillFs {
                         if let PathType::SkillMd { skill_name } = &old_type {
                             self.store.write().remove(skill_name);
                         }
+                        // Hermes nested manifests: a rename onto a nested
+                        // SKILL.md path re-parses it; a rename away drops
+                        // the leaf entry. The drop stays identity-gated —
+                        // the store keys nested skills by leaf, so another
+                        // category (or a categorized flat source) may own
+                        // the same key (the directory-rename arm's
+                        // discipline above).
+                        if let PathType::NestedSkillMd { skill_name, .. } = &new_type {
+                            self.send_sync(SyncEvent::Reparse {
+                                skill_name: skill_name.clone(),
+                                source_path: new_physical.clone(),
+                            });
+                        }
+                        if let PathType::NestedSkillMd {
+                            category,
+                            skill_name,
+                        } = &old_type
+                        {
+                            let chain = vec![category.clone(), skill_name.clone()];
+                            if self.rename_source_backs_store_entry(
+                                skill_name,
+                                RenameSourceIdentity::ExactChain(&chain),
+                            ) {
+                                self.store.write().remove(skill_name);
+                            }
+                        }
                     }
                 }
 

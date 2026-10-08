@@ -282,6 +282,22 @@ impl SkillFs {
                         });
                     }
                 }
+                // Hermes nested manifests live in the same store (keyed by
+                // their leaf name, like the categorized loader inserts
+                // them), so a nested SKILL.md write needs the same
+                // re-parse a flat one enqueues.
+                if let PathType::NestedSkillMd {
+                    category,
+                    skill_name,
+                } = &path_type
+                {
+                    self.send_sync(SyncEvent::Reparse {
+                        skill_name: skill_name.clone(),
+                        source_path: self
+                            .hermes_skill_physical_dir(category, skill_name)
+                            .join("SKILL.md"),
+                    });
+                }
                 // D1.3-demo: enqueue a debounced refresh. Write is the
                 // chunk-callback path, so we **never** run the resolve
                 // here — the controller runs on a separate worker.
@@ -683,6 +699,14 @@ impl SkillFs {
                             source_path: physical.clone(),
                         });
                     }
+                }
+                // Hermes nested manifest creation must teach the store the
+                // new leaf entry, mirroring the flat create above.
+                if let PathType::NestedSkillMd { skill_name, .. } = &path_type {
+                    self.send_sync(SyncEvent::Reparse {
+                        skill_name: skill_name.clone(),
+                        source_path: physical.clone(),
+                    });
                 }
 
                 // D1.3-demo: a freshly-created SKILL.md or passthrough
@@ -1400,6 +1424,14 @@ impl SkillFs {
                     }
                     // SKILL.md truncate triggers store reparse
                     if let PathType::SkillMd { ref skill_name } = path_type {
+                        self.send_sync(SyncEvent::Reparse {
+                            skill_name: skill_name.clone(),
+                            source_path: physical.clone(),
+                        });
+                    }
+                    // Hermes nested SKILL.md truncate re-parses too (the
+                    // store keys the leaf entry).
+                    if let PathType::NestedSkillMd { ref skill_name, .. } = path_type {
                         self.send_sync(SyncEvent::Reparse {
                             skill_name: skill_name.clone(),
                             source_path: physical.clone(),
