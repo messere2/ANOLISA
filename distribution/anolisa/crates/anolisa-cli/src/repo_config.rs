@@ -52,6 +52,7 @@ use std::time::Duration;
 use anolisa_platform::fs_layout::FsLayout;
 use serde::Deserialize;
 
+use crate::commands::common;
 use crate::packaged;
 
 /// Filename probed in every discovery location.
@@ -181,10 +182,13 @@ pub(crate) struct RepoConfigLoadResult {
 pub(crate) enum RepoConfigProvisioning {
     Existing,
     Downloaded {
+        /// Credential-free label of the bootstrap source (origin only for
+        /// http(s)) — `render_repo_config_provisioning` prints it verbatim.
         url: String,
         dest: PathBuf,
     },
     FetchedForDryRun {
+        /// Credential-free label of the bootstrap source, as `Downloaded`.
         url: String,
         dest: PathBuf,
     },
@@ -193,6 +197,7 @@ pub(crate) enum RepoConfigProvisioning {
     /// The in-memory config is valid; callers that only need read access may
     /// proceed and warn, while mutating commands should treat this as an error.
     DownloadedPersistFailed {
+        /// Credential-free label of the bootstrap source, as `Downloaded`.
         url: String,
         dest: PathBuf,
         reason: String,
@@ -336,6 +341,13 @@ impl RepoConfig {
             .etc
             .clone()
             .ok_or(RepoConfigProvisionError::Load(RepoConfigError::NotFound))?;
+        // The bootstrap URL is env-overridable (`ANOLISA_REPO_CONFIG_URL`)
+        // and may carry credentials or a secret path segment, exactly like a
+        // raw backend `base_url` (redact raw repository URLs). Everything
+        // derived from it that can reach a terminal or a pasted error report
+        // is reduced to its origin here; the raw form never leaves this
+        // function.
+        let bootstrap_label = common::repository_url_label(bootstrap_url);
         let body = fetch_repo_config_body(bootstrap_url)?;
         let mut config = Self::from_toml_str(&body).map_err(|err| {
             RepoConfigProvisionError::InvalidDownloaded {
@@ -347,7 +359,7 @@ impl RepoConfig {
             return Ok(RepoConfigLoadResult {
                 config,
                 provisioning: RepoConfigProvisioning::FetchedForDryRun {
-                    url: bootstrap_url.to_string(),
+                    url: bootstrap_label,
                     dest,
                 },
             });
@@ -359,7 +371,7 @@ impl RepoConfig {
                 Ok(RepoConfigLoadResult {
                     config,
                     provisioning: RepoConfigProvisioning::Downloaded {
-                        url: bootstrap_url.to_string(),
+                        url: bootstrap_label,
                         dest,
                     },
                 })
@@ -367,7 +379,7 @@ impl RepoConfig {
             Err(err) => Ok(RepoConfigLoadResult {
                 config,
                 provisioning: RepoConfigProvisioning::DownloadedPersistFailed {
-                    url: bootstrap_url.to_string(),
+                    url: bootstrap_label,
                     dest,
                     reason: err.to_string(),
                 },
@@ -607,7 +619,10 @@ pub fn normalize_override_url(url: &str) -> Result<String, RepoConfigError> {
 fn validate_base_url(backend: &str, url: &str, insecure: bool) -> Result<(), RepoConfigError> {
     let invalid = |reason: &str| RepoConfigError::InvalidBaseUrl {
         backend: backend.to_string(),
-        url: url.to_string(),
+        // The rejected value can carry credentials (userinfo) or a query
+        // token; keep the origin for http(s) so the entry is still
+        // identifiable, and never echo the raw form.
+        url: common::repository_url_label(url),
         reason: reason.to_string(),
     };
     let Some((scheme, rest)) = url.split_once("://") else {
@@ -848,8 +863,12 @@ fn fetch_repo_config_body(url: &str) -> Result<String, RepoConfigProvisionError>
         .get(url)
         .call()
         .map_err(|err| RepoConfigProvisionError::Fetch {
-            url: url.to_string(),
-            reason: err.to_string(),
+            // The ureq error text embeds the URL a second time (its Display
+            // prefixes it), so the reason is redacted against the known raw
+            // form — and withheld whole if a URL survives that cannot be
+            // shown to be credential-free.
+            url: common::repository_url_label(url),
+            reason: common::redact_known_urls(&err.to_string(), &[url.to_string()]),
         })?;
     let mut body = String::new();
     response
@@ -1280,6 +1299,161 @@ base_url = "file:///srv/existing"
             RepoConfigProvisionError::InvalidDownloaded { .. }
         ));
         assert!(!dest.exists(), "invalid config must not land on disk");
+    }
+
+    /// The bootstrap URL is env-overridable (`ANOLISA_REPO_CONFIG_URL`) and
+    /// may carry credentials or a secret path segment, exactly like a raw
+    /// backend `base_url` (redact raw repository URLs, 9b019aab5). Nothing
+    /// derived from it — the fetch-failure error, the provisioning notices,
+    /// a rejected `base_url` — may echo the raw form.
+    #[test]
+    fn bootstrap_fetch_failure_hides_url_credentials() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dest = tmp.path().join("etc/repo.toml");
+        // A scheme ureq rejects before any network I/O, so the failure (and
+        // the test) never leaves the machine.
+        let err = RepoConfig::load_with_sources(
+            missing_sources(dest),
+            false,
+            "ftp://user:secret@repo.example.invalid/repo.toml",
+        )
+        .expect_err("unknown scheme must fail the fetch");
+        let text = err.to_string();
+        assert!(
+            !text.contains("secret"),
+            "bootstrap URL leaked into the fetch failure: {text}"
+        );
+        // The diagnostic survives redaction: the operator still learns why.
+        assert!(
+            text.contains("Unknown Scheme"),
+            "the fetch reason must stay diagnosable: {text}"
+        );
+    }
+
+    fn serve_once_with_credentials(body: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        format!("http://user:secret@{addr}/repo.toml")
+    }
+
+    fn credential_url_authority(url: &str) -> String {
+        url.rsplit_once("user:secret@")
+            .expect("credential URL")
+            .1
+            .split('/')
+            .next()
+            .expect("authority")
+            .to_string()
+    }
+
+    #[test]
+    fn downloaded_provisioning_label_hides_url_credentials() {
+        let body = "schema_version = 1\ndefault_backend = \"raw\"\n\n[backends.raw]\nbase_url = \"https://example.com/v1/\"\n";
+        let url = serve_once_with_credentials(body.to_string());
+        let authority = credential_url_authority(&url);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dest = tmp.path().join("etc/repo.toml");
+
+        let result =
+            RepoConfig::load_with_sources(missing_sources(dest), false, &url).expect("download");
+
+        let RepoConfigProvisioning::Downloaded { url: shown, .. } = &result.provisioning else {
+            panic!("expected Downloaded, got {:?}", result.provisioning);
+        };
+        assert!(!shown.contains("secret"), "credential leaked: {shown}");
+        assert_eq!(shown, &format!("http://{authority}"));
+    }
+
+    #[test]
+    fn dry_run_provisioning_label_hides_url_credentials() {
+        let body = "schema_version = 1\ndefault_backend = \"raw\"\n\n[backends.raw]\nbase_url = \"https://example.com/v1/\"\n";
+        let url = serve_once_with_credentials(body.to_string());
+        let authority = credential_url_authority(&url);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dest = tmp.path().join("etc/repo.toml");
+
+        let result = RepoConfig::load_with_sources(missing_sources(dest), true, &url)
+            .expect("dry-run fetch");
+
+        let RepoConfigProvisioning::FetchedForDryRun { url: shown, .. } = &result.provisioning
+        else {
+            panic!("expected FetchedForDryRun, got {:?}", result.provisioning);
+        };
+        assert!(!shown.contains("secret"), "credential leaked: {shown}");
+        assert_eq!(shown, &format!("http://{authority}"));
+    }
+
+    #[test]
+    fn persist_failed_provisioning_label_hides_url_credentials() {
+        let body = "schema_version = 1\ndefault_backend = \"raw\"\n\n[backends.raw]\nbase_url = \"https://example.com/v1/\"\n";
+        let url = serve_once_with_credentials(body.to_string());
+        let tmp = tempfile::tempdir().expect("tmp");
+        // Parent is a file, so the persist write must fail (uid-independent).
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "I am a file").expect("create blocker file");
+        let dest = blocker.join("repo.toml");
+
+        let result = RepoConfig::load_with_sources(missing_sources(dest), false, &url)
+            .expect("download with persist failure");
+
+        let RepoConfigProvisioning::DownloadedPersistFailed { url: shown, .. } =
+            &result.provisioning
+        else {
+            panic!(
+                "expected DownloadedPersistFailed, got {:?}",
+                result.provisioning
+            );
+        };
+        assert!(!shown.contains("secret"), "credential leaked: {shown}");
+    }
+
+    #[test]
+    fn invalid_base_url_error_hides_credentials() {
+        let err = RepoConfig::from_toml_str(
+            r#"schema_version = 1
+default_backend = "raw"
+[backends.raw]
+base_url = "http://user:secret@repo.example.internal/anolisa"
+"#,
+        )
+        .expect_err("plain http without insecure must be rejected");
+        let text = err.to_string();
+        assert!(!text.contains("secret"), "credential leaked: {text}");
+        assert!(
+            text.contains("http://repo.example.internal"),
+            "the origin must stay diagnosable: {text}"
+        );
+    }
+
+    #[test]
+    fn invalid_base_url_error_hides_query_tokens() {
+        let err = RepoConfig::from_toml_str(
+            r#"schema_version = 1
+default_backend = "raw"
+[backends.raw]
+base_url = "https://repo.example.internal/repo?token=sekrit"
+"#,
+        )
+        .expect_err("query strings must be rejected");
+        let text = err.to_string();
+        assert!(!text.contains("sekrit"), "query secret leaked: {text}");
+        assert!(
+            text.contains("https://repo.example.internal"),
+            "the origin must stay diagnosable: {text}"
+        );
     }
 
     /// Etc-dir config wins over every other source — that is the

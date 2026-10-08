@@ -1102,13 +1102,17 @@ pub(crate) fn endpoint_without_credentials(url: &str) -> Option<String> {
 /// authority of an http(s) location, with credentials, path, and query
 /// dropped. A `file://` location keeps its path — it has no authority to
 /// hide and the tree it names is what operators need to see — while an
-/// http(s) URL whose authority cannot be isolated is reported as an opaque
-/// `<repository>`.
+/// http(s) URL whose authority cannot be isolated, and any location on a
+/// scheme this tree can never fetch, is reported as an opaque
+/// `<repository>`: a non-http(s) URL is always a fetch error here, and its
+/// textual form cannot be shown to be free of credentials.
 pub(crate) fn repository_url_label(url: &str) -> String {
     if url.starts_with("http://") || url.starts_with("https://") {
         endpoint_without_credentials(url).unwrap_or_else(|| "<repository>".to_string())
-    } else {
+    } else if url.starts_with("file://") {
         url.to_string()
+    } else {
+        "<repository>".to_string()
     }
 }
 
@@ -1130,6 +1134,22 @@ mod tests {
         assert_eq!(
             scoped_component_command(InstallationScope::User { uid: 1000 }, "repair", "cosh"),
             "anolisa --install-mode user repair cosh"
+        );
+    }
+
+    #[test]
+    fn repository_url_label_collapses_unfetchable_schemes() {
+        // http(s) keeps its origin; file keeps its path; any other scheme is
+        // never a fetchable location in this tree and cannot be shown to be
+        // free of credentials, so it collapses to the opaque label.
+        assert_eq!(
+            repository_url_label("https://user:secret@repo.example.internal/v1"),
+            "https://repo.example.internal"
+        );
+        assert_eq!(repository_url_label("file:///srv/repo"), "file:///srv/repo");
+        assert_eq!(
+            repository_url_label("ftp://user:secret@repo.example.internal/repo.toml"),
+            "<repository>"
         );
     }
 
