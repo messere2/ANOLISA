@@ -4916,12 +4916,51 @@ fn eval_tcp_moderate_rcvbuf(info: &SystemInfo, recs: &mut Vec<Recommendation>) -
 }
 
 fn eval_flow_limit_table_len(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/core/flow_limit_table_len";
+    eval_flow_limit_table_len_at(
+        info,
+        recs,
+        "/proc/sys/net/core/flow_limit_table_len",
+        "/proc/sys/net/core/flow_limit_cpu_bitmap",
+    )
+}
+
+/// Path-injectable form of [`eval_flow_limit_table_len`] (the `eval_*_at`
+/// pattern) so tests can force both branches of the bitmap gate with temp
+/// files instead of the live /proc.
+///
+/// `flow_limit_table_len` only sizes the per-CPU flow-limit buckets that
+/// `flow_limit_cpu_sysctl` allocates while a CPU is being written into
+/// `net.core.flow_limit_cpu_bitmap` (v6.6 net/core/sysctl_net_core.c:211-228:
+/// `len = sizeof(*cur) + netdev_flow_limit_table_len`, then
+/// `cur->num_buckets = netdev_flow_limit_table_len`), and `skb_flow_limit()`
+/// consults them only where `sd->flow_limit` is non-NULL — the CPUs the
+/// bitmap enabled. The bitmap ships empty, so on a stock host no per-CPU
+/// table exists at all and `flow_limit_table_len_sysctl` just stores the
+/// power-of-2 int: raising it there reallocates nothing and the advice is a
+/// no-op the administrator cannot even observe. Gate the rule on the bitmap
+/// enabling at least one CPU — the same configured-prerequisite gate the RPS
+/// rules got (rps_sock_flow_entries only fires once a receive queue's own
+/// flow table exists).
+fn eval_flow_limit_table_len_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    bitmap_path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
     let max_speed = info.network.iter().map(|n| n.speed_mbps).max().unwrap_or(0);
     if max_speed < 10000 {
+        return 1;
+    }
+    // The bitmap reads as a hex cpumask ("00000001,00000000"): all zeros
+    // means no CPU has a flow-limit table allocated, and an unreadable
+    // bitmap counts as unconfigured instead of firing.
+    let flow_limiting_enabled = std::fs::read_to_string(bitmap_path)
+        .map(|bitmap| bitmap.trim().chars().any(|c| c != '0' && c != ','))
+        .unwrap_or(false);
+    if !flow_limiting_enabled {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -10055,6 +10094,74 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn flow_limit_table_is_only_sized_where_flow_limiting_is_enabled() {
+        // flow_limit_table_len only sizes the per-CPU buckets that
+        // net.core.flow_limit_cpu_bitmap allocates (v6.6
+        // net/core/sysctl_net_core.c, flow_limit_cpu_sysctl:
+        // cur->num_buckets = netdev_flow_limit_table_len at allocation
+        // time), and the bitmap ships empty - skb_flow_limit() consults
+        // sd->flow_limit only on the CPUs it enabled. Raising the table
+        // length on a stock host reallocates nothing; the advice must wait
+        // for the prerequisite, exactly like the RPS rules' configured
+        // gates.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_flow_limit_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let knob = dir.join("flow_limit_table_len");
+        let bitmap = dir.join("flow_limit_cpu_bitmap");
+
+        let mut info = make_test_info();
+        info.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+
+        // Stock host: the bitmap is all zeros, no table was ever allocated.
+        std::fs::write(&knob, "4096\n").unwrap();
+        std::fs::write(&bitmap, "00000000,00000000\n").unwrap();
+        let mut recs = Vec::new();
+        eval_flow_limit_table_len_at(&info, &mut recs, knob.to_str().unwrap(), bitmap.to_str().unwrap());
+        assert!(
+            recs.is_empty(),
+            "an empty bitmap means no flow-limit table exists to resize"
+        );
+
+        // Flow limiting enabled on CPU 0: the advice fires and sizes the
+        // next allocation.
+        std::fs::write(&bitmap, "00000001,00000000\n").unwrap();
+        let mut recs = Vec::new();
+        eval_flow_limit_table_len_at(&info, &mut recs, knob.to_str().unwrap(), bitmap.to_str().unwrap());
+        let rec = recs
+            .iter()
+            .find(|r| r.param == "net.core.flow_limit_table_len")
+            .expect("an enabled bitmap with a 4096 table must get the raise");
+        assert_eq!(rec.recommended_value, "8192");
+
+        // Already at the target stays quiet.
+        std::fs::write(&knob, "8192\n").unwrap();
+        let mut recs = Vec::new();
+        eval_flow_limit_table_len_at(&info, &mut recs, knob.to_str().unwrap(), bitmap.to_str().unwrap());
+        assert!(recs.is_empty(), "8192 already meets the target");
+
+        // The link gate keeps working on its own.
+        std::fs::write(&knob, "4096\n").unwrap();
+        info.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 1000,
+        }];
+        let mut recs = Vec::new();
+        eval_flow_limit_table_len_at(&info, &mut recs, knob.to_str().unwrap(), bitmap.to_str().unwrap());
+        assert!(recs.is_empty(), "a 1 GbE link is not the flow-limit case");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     #[test]
     fn rfs_flow_table_is_only_sized_where_the_queue_flow_table_is() {
