@@ -29,6 +29,67 @@ enum RawVerdict {
     Detour(DetourVerdict),
 }
 
+/// Result of the cache-priority arbitration for one judged payload candidate.
+struct Arbitrated {
+    /// Net-benefit tokens after the discount (equal to the input when no
+    /// discount applied).
+    save_tokens: usize,
+    /// Evidence annotation for the applied discount, appended to the row's
+    /// evidence.
+    evidence_note: Option<String>,
+    /// Discounted below the noise line — the candidate is not reported.
+    below_noise_line: bool,
+}
+
+/// 仲裁——缓存优先原则 (playbook 规则 1): when the cache hit rate is high,
+/// history-editing strategies invalidate the KV cache from the edit point
+/// on, so their net benefit is the full-price share of the saved tokens.
+/// Below the noise line after discounting → dismissed deterministically.
+fn arbitrate_cache_priority(
+    cand_id: &str,
+    save_tokens: usize,
+    cache_hit: Option<f64>,
+    total_billed: usize,
+) -> Arbitrated {
+    let Some(m3) = cache_hit else {
+        return Arbitrated {
+            save_tokens,
+            evidence_note: None,
+            below_noise_line: false,
+        };
+    };
+    // 提示词压缩 (user_prompt) edits the context exactly where the oversized
+    // user message sits — at the very front for a leading prompt — so it
+    // breaks the cached prefix like any other history edit and nets the same
+    // full-price-share correction.
+    if m3 > 0.5 && matches!(cand_id, "history" | "tool_output" | "user_prompt") {
+        let factor = 1.0 - m3 * (1.0 - CACHED_PRICE_RATIO);
+        let adjusted = (save_tokens as f64 * factor).round() as usize;
+        tracing::info!(
+            "Cost: 缓存优先仲裁 '{cand_id}' — M3={:.0}%，净收益 {save_tokens} → {adjusted} tok",
+            m3 * 100.0
+        );
+        if (adjusted as f64 / total_billed.max(1) as f64) < NOISE_LINE {
+            tracing::info!("Cost: strategy '{cand_id}' ✗ 缓存折算后低于噪声线，不报");
+            return Arbitrated {
+                save_tokens: adjusted,
+                evidence_note: None,
+                below_noise_line: true,
+            };
+        }
+        return Arbitrated {
+            save_tokens: adjusted,
+            evidence_note: Some(format!("（已按 M3={:.0}% 缓存命中折算净收益）", m3 * 100.0)),
+            below_noise_line: false,
+        };
+    }
+    Arbitrated {
+        save_tokens,
+        evidence_note: None,
+        below_noise_line: false,
+    }
+}
+
 /// Run full cost-waste identification: Rust candidate extraction → parallel per-candidate LLM eval → merge.
 /// Parses events only once and reuses them for both cost computation and candidate extraction.
 pub async fn identify_waste(
@@ -152,35 +213,17 @@ pub async fn identify_waste(
             v.evidence.clone()
         };
 
-        // 仲裁——缓存优先原则 (playbook 规则 1): when the cache hit rate is high,
-        // history-editing strategies invalidate the KV cache from the edit point
-        // on, so their net benefit is the full-price share of the saved tokens.
-        // Below the noise line after discounting → dismissed deterministically.
+        // 仲裁——缓存优先原则 (playbook 规则 1), see `arbitrate_cache_priority`.
         // (主手段去重——playbook 规则 2——needs no code: candidate sources are
         // disjoint by construction: assistant history vs tool results vs inputs.)
-        if let Some(m3) = cache_hit {
-            if m3 > 0.5 && matches!(cand.id.as_str(), "history" | "tool_output") {
-                let factor = 1.0 - m3 * (1.0 - CACHED_PRICE_RATIO);
-                let adjusted = (save_tokens as f64 * factor).round() as usize;
-                tracing::info!(
-                    "Cost: 缓存优先仲裁 '{}' — M3={:.0}%，净收益 {} → {} tok",
-                    cand.id,
-                    m3 * 100.0,
-                    save_tokens,
-                    adjusted
-                );
-                if (adjusted as f64 / total_billed as f64) < NOISE_LINE {
-                    tracing::info!("Cost: strategy '{}' ✗ 缓存折算后低于噪声线，不报", cand.id);
-                    dismissed += 1;
-                    continue;
-                }
-                save_tokens = adjusted;
-                evidence = format!(
-                    "{}（已按 M3={:.0}% 缓存命中折算净收益）",
-                    evidence,
-                    m3 * 100.0
-                );
-            }
+        let arbitrated = arbitrate_cache_priority(&cand.id, save_tokens, cache_hit, total_billed);
+        if arbitrated.below_noise_line {
+            dismissed += 1;
+            continue;
+        }
+        if let Some(note) = arbitrated.evidence_note {
+            save_tokens = arbitrated.save_tokens;
+            evidence = format!("{evidence}{note}");
         }
 
         items.push(WasteItem {
@@ -520,5 +563,76 @@ mod tests {
             report.is_err(),
             "all judgments failed against a dead endpoint; expected Err, got {report:?}"
         );
+    }
+
+    // ── 缓存优先仲裁 ──
+
+    /// The playbook formula, pinned: a history edit on an 80%-cache trajectory
+    /// keeps the full-price share 1 − m3·(1 − cached price) of its savings
+    /// (100 000 × 0.4 = 40 000 tok, 4% of the bill — above the noise line).
+    #[test]
+    fn history_arbitration_follows_the_playbook_formula() {
+        let h = arbitrate_cache_priority("history", 100_000, Some(0.8), 1_000_000);
+        assert_eq!(h.save_tokens, 40_000);
+        assert!(!h.below_noise_line);
+        assert!(h.evidence_note.is_some());
+    }
+
+    /// Prompt compression edits the context exactly where the oversized user
+    /// message sits (at the very front for a leading prompt), so on a
+    /// cache-warm trajectory its net benefit must be discounted like any
+    /// other history edit. Without the discount the waste table advertises
+    /// 提示词压缩 at full price next to a discounted 历史消息裁剪 row counted
+    /// over the same replayed tokens.
+    #[test]
+    fn prompt_compression_is_discounted_like_other_history_edits() {
+        let history = arbitrate_cache_priority("history", 100_000, Some(0.8), 1_000_000);
+        let up = arbitrate_cache_priority("user_prompt", 100_000, Some(0.8), 1_000_000);
+        assert_eq!(
+            up.save_tokens, history.save_tokens,
+            "prompt compression and history pruning edit the same replayed context"
+        );
+        assert!(
+            up.evidence_note.is_some(),
+            "the discount must be visible in the evidence"
+        );
+    }
+
+    /// A discount that sinks the net benefit below the noise line dismisses
+    /// the candidate — for prompt compression exactly as for history pruning.
+    #[test]
+    fn prompt_compression_below_the_noise_line_is_dismissed() {
+        // 2 000 tok on a 200 000 bill is 1% undiscounted (above the 3% line),
+        // but the 90%-cache factor 0.325 sinks it to 650 tok = 0.325%.
+        let up = arbitrate_cache_priority("user_prompt", 2_000, Some(0.9), 200_000);
+        assert!(
+            up.below_noise_line,
+            "a cache-warm micro-candidate must be dismissed after the discount"
+        );
+    }
+
+    /// The discount is a cache-warm correction only: a cold cache and the
+    /// candidates that are not history edits (the cache strategy itself is
+    /// discounted at extraction; detour savings are next-session, full price)
+    /// keep their full savings.
+    #[test]
+    fn cold_cache_and_non_history_candidates_keep_full_savings() {
+        for id in ["user_prompt", "history", "tool_output"] {
+            let cold = arbitrate_cache_priority(id, 10_000, Some(0.2), 1_000_000);
+            assert_eq!(
+                cold.save_tokens, 10_000,
+                "{id} cold cache keeps full savings"
+            );
+            assert!(cold.evidence_note.is_none());
+            let no_usage = arbitrate_cache_priority(id, 10_000, None, 1_000_000);
+            assert_eq!(
+                no_usage.save_tokens, 10_000,
+                "{id} without usage keeps full savings"
+            );
+        }
+        for id in ["fixed_overhead", "detour"] {
+            let warm = arbitrate_cache_priority(id, 10_000, Some(0.9), 1_000_000);
+            assert_eq!(warm.save_tokens, 10_000, "{id} is not a history edit");
+        }
     }
 }
