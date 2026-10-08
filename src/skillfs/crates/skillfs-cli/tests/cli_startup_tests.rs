@@ -3524,7 +3524,12 @@ fn mount_file_aggregates_whole_skills_read_only() {
             .unwrap(),
         mount.clone(),
     );
-    for _ in 0..100 {
+    // 30 s readiness budget (50 ms x 600), the same cap the in-process
+    // polling fixtures use: the spawned CLI runs the environment-profile
+    // probe loop before its FUSE session comes up, which alone can take
+    // seconds on a loaded host - the previous 5 s budget raced it and the
+    // assertion reported the startup log instead of the aggregated view.
+    for _ in 0..600 {
         if is_mounted(&mount) || child.0.try_wait().unwrap().is_some() {
             break;
         }
