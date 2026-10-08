@@ -437,7 +437,13 @@ fn cgroup_v2_relative_path(content: &str) -> Option<String> {
 /// field) and other controllers' lines never match.
 fn cgroup_v1_relative_path(content: &str) -> Option<String> {
     content.lines().find_map(|line| {
-        let mut fields = line.split(':');
+        // The path field runs to the end of the line: kernfs only forbids
+        // '/' and '\0' in cgroup names, so the directory itself may be
+        // named with a colon (`11:memory:/lxc:web` is the cgroup
+        // `/lxc:web`, not `/lxc` — an unrelated sibling). The bounded
+        // split keeps the whole path; the CPU reader of this file already
+        // parses its v1 lines this way.
+        let mut fields = line.splitn(3, ':');
         let hierarchy = fields.next()?;
         let controllers = fields.next()?;
         let path = fields.next()?;
@@ -456,7 +462,19 @@ fn cgroup_v1_relative_path(content: &str) -> Option<String> {
 /// `None` when no level of the chain offers the file at all, so the caller
 /// can fall back to the next hierarchy.
 fn chain_limit_kb(root: &Path, rel: &str, file: &str, parse: fn(&str) -> u64) -> Option<u64> {
-    let mut dir = root.join(rel.trim_start_matches('/'));
+    // Namespace-relative parent components must never walk above this
+    // mount — the same guard cpu_chain_limit carries. A membership path
+    // carrying `..` would otherwise read limit files outside the root the
+    // walk was given instead of refusing and letting the caller fall
+    // through to its documented root approximation.
+    let rel = rel.trim_start_matches('/');
+    if Path::new(rel)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let mut dir = root.join(rel);
     let mut saw_limit_file = false;
     let mut best: u64 = 0;
     loop {
@@ -2603,3 +2621,6 @@ mod tests {
 #[cfg(test)]
 #[path = "cpu_hierarchy_tests.rs"]
 mod cpu_hierarchy_tests;
+#[cfg(test)]
+#[path = "memory_hierarchy_tests.rs"]
+mod memory_hierarchy_tests;
