@@ -64,7 +64,9 @@ pub async fn list_trajectories(
         fetch_limit,
     ) {
         Ok(mut rows) => {
-            filter_rows_by_reuse_labels(state.as_ref(), &query, &mut rows);
+            if let Err(response) = filter_rows_by_reuse_labels(state.as_ref(), &query, &mut rows) {
+                return response;
+            }
             rows.truncate(limit as usize);
             HttpResponse::Ok().json(rows)
         }
@@ -116,15 +118,27 @@ fn reject_unknown_label_tokens(query: &TrajectoryQuery) -> Result<(), HttpRespon
     Ok(())
 }
 
+/// A `reuse.db` read failure while resolving label filters.
+///
+/// Collapsing it into an empty label set is not a safe default: `label=good`
+/// would answer "no such trajectories", and `exclude_label` would fail open
+/// and serve the very rows the caller asked to keep out. The caller cannot
+/// tell either outcome from a filter that genuinely matched nothing, so the
+/// failure is reported as a 500 — same contract as the Linux endpoint
+/// (168141e1b).
+fn reuse_store_failure(error: impl std::fmt::Display) -> HttpResponse {
+    HttpResponse::InternalServerError().json(serde_json::json!({"error": error.to_string()}))
+}
+
 /// Applies the reuse-label query parameters; mirrors the Linux endpoint's
 /// filter so a skill gets the same answer on either platform.
 fn filter_rows_by_reuse_labels(
     state: &LocalState,
     query: &TrajectoryQuery,
     rows: &mut Vec<agentsight_trajectory_collector::TrajectorySummary>,
-) {
+) -> Result<(), HttpResponse> {
     if !reuse_label_filter_requested(query) {
-        return;
+        return Ok(());
     }
     let Some(labels) = state.reuse_store.as_deref() else {
         // No label store: nothing has been assessed, so a positive filter
@@ -133,7 +147,7 @@ fn filter_rows_by_reuse_labels(
         if query.label.is_some() || query.human_backed == Some(true) {
             rows.clear();
         }
-        return;
+        return Ok(());
     };
     // Tokens were validated when the request entered the handler, so every
     // one of them parses here.
@@ -144,35 +158,36 @@ fn filter_rows_by_reuse_labels(
             .filter_map(crate::reuse::TrajectoryLabel::parse)
             .collect()
     };
-    let keep: Option<std::collections::HashSet<String>> = query.label.as_deref().map(|raw| {
-        labels
-            .sessions_with_labels(&parse(raw))
-            .unwrap_or_default()
-            .into_iter()
-            .collect()
-    });
-    let drop: Option<std::collections::HashSet<String>> =
-        query.exclude_label.as_deref().map(|raw| {
-            labels
-                .sessions_with_labels(&parse(raw))
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
-        });
+    let keep: Option<std::collections::HashSet<String>> = query
+        .label
+        .as_deref()
+        .map(|raw| labels.sessions_with_labels(&parse(raw)))
+        .transpose()
+        .map_err(reuse_store_failure)?
+        .map(|ids| ids.into_iter().collect());
+    let drop: Option<std::collections::HashSet<String>> = query
+        .exclude_label
+        .as_deref()
+        .map(|raw| labels.sessions_with_labels(&parse(raw)))
+        .transpose()
+        .map_err(reuse_store_failure)?
+        .map(|ids| ids.into_iter().collect());
     // `human_backed` is a tri-state filter: absent keeps every row, `true`
     // keeps only human-settled rows, and `false` keeps only rows no person has
     // settled — including never-triaged rows, which have no label row at all.
     // Mirror of the Linux endpoint's filter.
     let human_backed = query.human_backed;
-    let settled: Option<std::collections::HashSet<String>> = human_backed.map(|_| {
-        labels
-            .list_labels(&crate::reuse::LabelFilter::default())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|l| l.is_human_backed())
-            .map(|l| l.session_id)
-            .collect()
-    });
+    let settled: Option<std::collections::HashSet<String>> = human_backed
+        .map(|_| labels.list_labels(&crate::reuse::LabelFilter::default()))
+        .transpose()
+        .map_err(reuse_store_failure)?
+        .map(|labels| {
+            labels
+                .into_iter()
+                .filter(|l| l.is_human_backed())
+                .map(|l| l.session_id)
+                .collect()
+        });
     rows.retain(|row| {
         let id = row.session_id.as_str();
         keep.as_ref().is_none_or(|set| set.contains(id))
@@ -181,6 +196,7 @@ fn filter_rows_by_reuse_labels(
                 .as_ref()
                 .is_none_or(|set| human_backed == Some(set.contains(id)))
     });
+    Ok(())
 }
 
 /// GET /api/trajectories/filters
@@ -601,6 +617,78 @@ mod tests {
         assert!(resp.status().is_success());
         let rows: serde_json::Value = test::read_body_json(resp).await;
         assert_eq!(session_ids(&rows), vec!["settled".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Mirror of the Linux endpoint's contract (168141e1b): a `reuse.db` read
+    /// failure while resolving label filters must be reported as a 500, not
+    /// collapsed into an empty label set. Collapsing made `label=good` answer
+    /// "no such trajectories" and `exclude_label` fail open — serving the very
+    /// rows the caller asked to keep out — each indistinguishable from a
+    /// genuine filter result.
+    #[actix_web::test]
+    async fn trajectory_label_filter_reports_a_store_failure_instead_of_failing_open() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agentsight_local_label_store_error_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let db_path = tmp.join("trajectories.db");
+        {
+            let store = TrajectoryStore::new_with_path(&db_path).unwrap();
+            let record = agentsight_trajectory_collector::TrajectoryRecord {
+                session_id: "s-1".to_string(),
+                schema_version: "ATIF-v1.7".to_string(),
+                agent_name: "qoder".to_string(),
+                model_name: None,
+                num_steps: 1,
+                total_prompt_tokens: None,
+                total_completion_tokens: None,
+                start_time: None,
+                end_time: None,
+                first_user_message: None,
+                last_user_message: None,
+                atif_json: "{\"schema_version\":\"ATIF-v1.7\",\"steps\":[]}".to_string(),
+                project: "p".to_string(),
+                source: "qoder".to_string(),
+                is_subagent: false,
+                file_path: "/tmp/s-1.jsonl".to_string(),
+                file_size: 1,
+                file_mtime_ns: 1,
+            };
+            store.upsert_trajectory(&record).unwrap();
+        }
+
+        let store = Arc::new(TrajectoryStore::new_with_path(&db_path).unwrap());
+        let reuse_dir = tmp.join("reuse");
+        std::fs::create_dir_all(&reuse_dir).unwrap();
+        let reuse = crate::reuse::ReuseStore::open_private(&reuse_dir).unwrap();
+        // Make every label query fail the way a missing/renamed table or an
+        // I/O error would, on the same database file the store keeps open.
+        let conn = rusqlite::Connection::open(reuse_dir.join(crate::config::REUSE_DB_NAME))
+            .expect("open reuse.db");
+        conn.execute("DROP TABLE session_labels", [])
+            .expect("drop label table");
+
+        let state = make_state_with_reuse(store, Arc::new(reuse), db_path.clone());
+        let app = test::init_service(App::new().app_data(state).service(list_trajectories)).await;
+
+        for uri in [
+            "/api/trajectories?exclude_label=useless",
+            "/api/trajectories?label=good",
+            "/api/trajectories?human_backed=false",
+        ] {
+            let resp =
+                test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+            assert_eq!(
+                resp.status(),
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{uri} must report the store failure, not filter on an empty label set"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
