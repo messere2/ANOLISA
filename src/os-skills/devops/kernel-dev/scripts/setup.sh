@@ -43,7 +43,14 @@ echo ""
 # Check OS
 echo -e "${BLUE}Step 2: OS Verification${NC}"
 if grep -qi 'alinux\|alnx' /etc/os-release 2>/dev/null; then
-    OS_NAME=$(grep -i 'PRETTY_NAME' /etc/os-release | cut -d'"' -f2)
+    # os-release(5) allows double-quoted, single-quoted and unquoted
+    # values; cut on '"' alone returned an empty field for the other
+    # two styles. Take everything past the first '=' and strip quotes.
+    OS_NAME=$(grep -i '^PRETTY_NAME=' /etc/os-release | head -1 | cut -d'=' -f2-)
+    OS_NAME="${OS_NAME#\"}"
+    OS_NAME="${OS_NAME%\"}"
+    OS_NAME="${OS_NAME#\'}"
+    OS_NAME="${OS_NAME%\'}"
     echo -e "  ${GREEN}✓${NC} $OS_NAME"
 else
     echo -e "  ${YELLOW}⚠${NC} Warning: Not Alinux4 system"
