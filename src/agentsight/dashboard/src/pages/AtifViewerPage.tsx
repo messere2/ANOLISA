@@ -216,6 +216,7 @@ const StepCard: React.FC<StepCardProps> = ({ step, expandedSections, onToggleSec
   const isOpen = (name: string) => expandedSections.has(sectionKey(name));
   const toggle = (name: string) => onToggleSection(sectionKey(name));
 
+  const isAgent = step.source === 'agent';
   const hasReasoning = !!step.reasoning_content;
   const toolCalls = toolCallsOf(step);
   const observationResults = observationResultsOf(step);
@@ -258,11 +259,11 @@ const StepCard: React.FC<StepCardProps> = ({ step, expandedSections, onToggleSec
             <span className="text-xs text-gray-400 italic">{t('atif.noMessageContent')}</span>
           )}
 
-          {/* Agent-only sections */}
-          {step.source === 'agent' && (
+          {/* Captured observations can also accompany user turns. */}
+          {(isAgent || hasObservation) && (
             <>
               {/* Reasoning */}
-              {hasReasoning && (
+              {isAgent && hasReasoning && (
                 <Collapsible
                   icon="💭"
                   title={t('atif.reasoning')}
@@ -276,7 +277,7 @@ const StepCard: React.FC<StepCardProps> = ({ step, expandedSections, onToggleSec
               )}
 
               {/* Tool Calls */}
-              {hasToolCalls && (
+              {isAgent && hasToolCalls && (
                 <Collapsible
                   icon="🔧"
                   title={t('atif.toolCall')}
@@ -345,7 +346,7 @@ const StepCard: React.FC<StepCardProps> = ({ step, expandedSections, onToggleSec
               )}
 
               {/* Metrics */}
-              {hasMetrics && (
+              {isAgent && hasMetrics && (
                 <div className="flex flex-wrap gap-2 mt-3 pt-3 border-t border-gray-100">
                   {step.metrics!.prompt_tokens != null && (
                     <span className="px-2 py-1 bg-blue-50 text-blue-700 rounded text-xs">
