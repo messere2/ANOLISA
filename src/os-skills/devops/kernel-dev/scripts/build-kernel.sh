@@ -4,6 +4,7 @@
 # Usage: ./build-kernel.sh [srpm|upstream] [options]
 
 set -e
+set -o pipefail
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -42,7 +43,7 @@ check_root() {
 detect_system() {
     ARCH=$(uname -m)
     KERNEL_VER=$(uname -r)
-    OS_ID=$(grep -i '^ID=' /etc/os-release | cut -d'=' -f2 | tr -d '"')
+    OS_ID=$(grep -i '^ID=' /etc/os-release | cut -d'=' -f2 | tr -d '"' || true)
     
     info "Architecture: $ARCH"
     info "Current Kernel: $KERNEL_VER"
@@ -92,13 +93,13 @@ install_deps() {
 # Get latest stable kernel version from kernel.org
 get_latest_kernel() {
     local version
-    version=$(curl -sL https://kernel.org/ 2>/dev/null | grep -o 'linux-[0-9.]*\.tar\.xz' | head -1 | sed 's/linux-//;s/\.tar\.xz//')
+    version=$(curl -sL https://kernel.org/ 2>/dev/null | grep -o 'linux-[0-9.]*\.tar\.xz' | head -1 | sed 's/linux-//;s/\.tar\.xz//' || true)
     
     if [ -z "$version" ]; then
         version="6.12.9"  # Fallback version
-        warn "Could not fetch latest version, using fallback: $version"
+        warn "Could not fetch latest version, using fallback: $version" >&2
     else
-        success "Latest stable kernel: $version"
+        success "Latest stable kernel: $version" >&2
     fi
     
     echo "$version"
@@ -153,7 +154,10 @@ build_srpm() {
     info "Monitor progress: tail -f $LOG_FILE"
     
     # Wait for completion
-    wait $build_pid
+    wait "$build_pid" || {
+        error "SRPM kernel build failed (see $LOG_FILE)"
+        exit 1
+    }
     
     success "SRPM build completed"
     info "RPMs location: $OUTPUT_DIR/RPMS/x86_64/"
@@ -250,7 +254,10 @@ build_upstream() {
     info "Monitor progress: tail -f $LOG_FILE"
     
     # Wait for completion
-    wait $build_pid
+    wait "$build_pid" || {
+        error "Kernel image build failed (see $LOG_FILE)"
+        exit 1
+    }
     
     # Build modules
     info "Building kernel modules..."
