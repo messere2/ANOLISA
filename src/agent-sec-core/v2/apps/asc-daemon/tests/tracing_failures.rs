@@ -58,21 +58,32 @@ async fn read(stream: UnixStream) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 async fn call(path: &Path, request: Value) -> Value {
-    let mut stream = UnixStream::connect(path).await.unwrap();
+    let mut stream = connect_ready(path).await;
     let mut bytes = serde_json::to_vec(&request).unwrap();
     bytes.push(b'\n');
     stream.write_all(&bytes).await.unwrap();
     read(stream).await
 }
 
-async fn wait_for_socket(path: &Path) {
+/// Readiness is a successful connection, not the socket file's
+/// existence: the file is created by `bind(2)` before the listener
+/// accepts, so an existence-based waiting can issue `connect(2)`
+/// inside that window and observe `ECONNREFUSED` (the protocol tests
+/// already use this connect-based readiness). Returning the stream
+/// avoids a dropped probe connection, which matters here: the suite
+/// runs with `max_connections = 1`, where a probe could steal the
+/// single admission slot from the first request.
+async fn connect_ready(path: &Path) -> UnixStream {
     tokio::time::timeout(WATCHDOG, async {
-        while !path.exists() {
-            tokio::task::yield_now().await;
+        loop {
+            if let Ok(stream) = UnixStream::connect(path).await {
+                return stream;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("the daemon should accept connections on its socket")
 }
 fn has_error(span: &SpanData, category: &str) -> bool {
     span.status == Status::error(category.to_owned())
@@ -137,7 +148,6 @@ async fn uds_failures_preserve_business_and_context() {
             .await
             .unwrap();
     });
-    wait_for_socket(&path).await;
     let list = json!({"method":"policy.templates.list"});
     assert!(call(&path, list.clone()).await.get("result").is_some());
     for index in 0..12 {

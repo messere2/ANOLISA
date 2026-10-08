@@ -75,8 +75,7 @@ async fn tracing_span_remains_open_after_dispatch_timeout_until_work_finishes() 
         .await
         .unwrap();
     });
-    wait_for_socket(&path).await;
-    let mut stream = UnixStream::connect(&path).await.unwrap();
+    let mut stream = connect_ready(&path).await;
     stream
         .write_all(b"{\"method\":\"policy.templates.list\"}\n")
         .await
@@ -131,12 +130,20 @@ async fn tracing_span_remains_open_after_dispatch_timeout_until_work_finishes() 
     std::fs::remove_dir_all(directory).unwrap();
 }
 
-async fn wait_for_socket(path: &std::path::Path) {
+/// Readiness is a successful connection, not the socket file's
+/// existence: the file is created by `bind(2)` before the listener
+/// accepts, so an existence-based spin can issue `connect(2)` inside
+/// that window and observe `ECONNREFUSED` (the protocol tests already
+/// use this connect-based readiness).
+async fn connect_ready(path: &std::path::Path) -> UnixStream {
     tokio::time::timeout(Duration::from_secs(2), async {
-        while !path.exists() {
-            tokio::task::yield_now().await;
+        loop {
+            if let Ok(stream) = UnixStream::connect(path).await {
+                return stream;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("the daemon should accept connections on its socket")
 }
