@@ -6588,12 +6588,58 @@ fn eval_neigh_default_gc_stale_time(_info: &SystemInfo, recs: &mut Vec<Recommend
 }
 
 fn eval_tcp_fastopen_blackhole_timeout(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec";
-    if !std::path::Path::new(path).exists() {
+    eval_tcp_fastopen_blackhole_timeout_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec",
+        "/proc/sys/net/ipv4/tcp_fastopen",
+        info.has_listen_sockets(),
+    )
+}
+
+/// Path-injectable form of [`eval_tcp_fastopen_blackhole_timeout`] (the
+/// `eval_*_at` idiom) so the client-bit precondition is assertable against
+/// synthetic files on any host, listener or not.
+///
+/// The timeout only ever gates connections that already attempted TFO in
+/// their SYN: both of its readers sit in the active-disable logic
+/// (`tcp_fastopen_active_disable()` and `tcp_fastopen_active_should_disable()`,
+/// net/ipv4/tcp_fastopen.c v6.6 :495/:517, master :586/:608), and every path
+/// into that logic starts from a fast open that happened — the cookie check
+/// on the send side, or the retransmission/OFO symptoms of a SYN that
+/// carried data. The sole client-side entry, `tcp_sendmsg_fastopen()`
+/// (net/ipv4/tcp.c v6.6 :998, master :1059), returns `-EOPNOTSUPP` unless
+/// the flag word carries `TFO_CLIENT_ENABLE` (bit 0x1, include/net/tcp.h),
+/// and a listening socket never consults the timeout at all. With the client
+/// bit clear the recommended 0 changes no behaviour on the host while the
+/// reason promises "每次连接都尝试 TFO" — a state that host cannot reach by
+/// writing this knob — the "never recommend a no-op" rule the core_uses_pid,
+/// hardlockup_panic and page-cluster gates follow.
+///
+/// The flag word is read signed, like the `tcp_fastopen` rule itself: the
+/// sysctl is a plain `proc_dointvec` int where `-1` is the legal
+/// every-flag-set word, and an unsigned parse would misread that host as
+/// client-disabled. A missing or unparsable word keeps the recommendation:
+/// the per-netns default is `sysctl_tcp_fastopen = TFO_CLIENT_ENABLE`
+/// (net/ipv4/tcp_ipv4.c v6.6 :3267, master :3516), so a failed read leaves
+/// the kernel default — a client that does read the knob.
+fn eval_tcp_fastopen_blackhole_timeout_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    tcp_fastopen_path: &str,
+    has_listen_sockets: bool,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
-    if !info.has_listen_sockets() {
+    if !has_listen_sockets {
         return 1;
+    }
+    if let Ok(flags_word) = std::fs::read_to_string(tcp_fastopen_path) {
+        if !outbound_tfo_is_enabled(&flags_word) {
+            return 1;
+        }
     }
     let current = read_sysctl_u64(path);
     if current > 3600 {
@@ -6608,6 +6654,22 @@ fn eval_tcp_fastopen_blackhole_timeout(info: &SystemInfo, recs: &mut Vec<Recomme
         });
     }
     1
+}
+
+/// Whether an outbound connection can still attempt TFO on this host, i.e.
+/// whether the `net.ipv4.tcp_fastopen` word carries `TFO_CLIENT_ENABLE`
+/// (0x1, include/net/tcp.h) — the bit `tcp_sendmsg_fastopen()` requires
+/// before any connection reaches the blackhole logic that reads the timeout.
+/// The word is parsed signed for the same reason the `tcp_fastopen` rule
+/// reads it signed: `-1` is every flag set, an enabled client included. An
+/// unparsable word counts as enabled, mirroring the per-netns default
+/// (`TFO_CLIENT_ENABLE`) a failed read leaves behind.
+fn outbound_tfo_is_enabled(flags_word: &str) -> bool {
+    flags_word
+        .trim()
+        .parse::<i64>()
+        .map(|flags| flags & 0x1 != 0)
+        .unwrap_or(true)
 }
 
 fn eval_max_queued_signals(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -7533,6 +7595,93 @@ mod tests {
             "a host without listeners is not recommended TFO"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tfo_blackhole_advice_needs_the_client_bit() {
+        // net/ipv4/tcp.c v6.6 :998 (master :1059): tcp_sendmsg_fastopen()
+        // returns -EOPNOTSUPP unless sysctl_tcp_fastopen carries
+        // TFO_CLIENT_ENABLE (0x1), and the timeout's only readers sit behind
+        // that gate (net/ipv4/tcp_fastopen.c v6.6 :495/:517, master
+        // :586/:608) — no outbound connection ever reaches the blackhole
+        // logic, so the recommended 0 cannot make "每次连接都尝试 TFO" true.
+        let dir = std::env::temp_dir().join(format!("ktuner-tfo-blackhole-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let knob = dir.join("tcp_fastopen_blackhole_timeout_sec");
+        std::fs::write(&knob, b"7200\n").unwrap();
+        let flags = |name: &str, word: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, word).unwrap();
+            p
+        };
+
+        let client_off = [
+            flags("flags.zero", "0\n"),
+            flags("flags.server_only", "2\n"),
+            flags("flags.no_cookie_only", "4\n"),
+        ];
+        for word in &client_off {
+            let info = make_test_info();
+            let mut recs = Vec::new();
+            eval_tcp_fastopen_blackhole_timeout_at(
+                &info,
+                &mut recs,
+                knob.to_str().unwrap(),
+                word.to_str().unwrap(),
+                true,
+            );
+            assert!(
+                recs.iter()
+                    .all(|r| r.param != "net.ipv4.tcp_fastopen_blackhole_timeout_sec"),
+                "{}: with the client bit clear no connection can attempt TFO, so the write is a no-op",
+                word.display()
+            );
+        }
+
+        // Client on (0x1), fully flagged (-1) and a missing word (the
+        // per-netns default is TFO_CLIENT_ENABLE) all keep the rule.
+        let client_on = [
+            flags("flags.one", "1\n"),
+            flags("flags.three", "3\n"),
+            flags("flags.minus_one", "-1\n"),
+            dir.join("flags.missing"),
+        ];
+        for word in &client_on {
+            let info = make_test_info();
+            let mut recs = Vec::new();
+            eval_tcp_fastopen_blackhole_timeout_at(
+                &info,
+                &mut recs,
+                knob.to_str().unwrap(),
+                word.to_str().unwrap(),
+                true,
+            );
+            assert!(
+                recs.iter()
+                    .any(|r| r.param == "net.ipv4.tcp_fastopen_blackhole_timeout_sec"),
+                "{}: a client that can attempt TFO keeps the advice",
+                word.display()
+            );
+        }
+
+        // The timeout threshold itself is unchanged: at the documented
+        // ceiling the rule stays quiet even with the client on.
+        std::fs::write(&knob, b"3600\n").unwrap();
+        let info = make_test_info();
+        let mut recs = Vec::new();
+        eval_tcp_fastopen_blackhole_timeout_at(
+            &info,
+            &mut recs,
+            knob.to_str().unwrap(),
+            dir.join("flags.one").to_str().unwrap(),
+            true,
+        );
+        assert!(
+            recs.iter()
+                .all(|r| r.param != "net.ipv4.tcp_fastopen_blackhole_timeout_sec"),
+            "3600 is not above the threshold the rule speaks from"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
