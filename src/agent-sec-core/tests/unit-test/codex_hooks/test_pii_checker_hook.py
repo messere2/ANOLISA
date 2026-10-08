@@ -233,6 +233,19 @@ class TestFailOpen:
         output = _run_hook(_USER_PROMPT_EVENT, env_override=env)
         assert output == {}
 
+    @pytest.mark.parametrize(
+        "payload",
+        ["null", '[{"verdict": "deny"}]', '"deny"', "7"],
+    )
+    def test_cli_non_object_json_allows(self, mock_cli, payload):
+        # A scan result that is valid JSON but not an object has no .get;
+        # the hook must fail open (empty stdout, exit 0) instead of dying
+        # with AttributeError — the same guard the qwen, qoder and cosh
+        # copies of this hook already carry.
+        env = mock_cli(output=payload, extra={"PII_CHECKER_MODE": "deny"})
+        output = _run_hook(_USER_PROMPT_EVENT, env_override=env)
+        assert output == {}
+
 
 class TestTextExtraction:
     """Verify text extraction for different hook events."""

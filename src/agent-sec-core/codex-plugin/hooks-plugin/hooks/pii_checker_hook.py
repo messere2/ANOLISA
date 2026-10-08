@@ -317,6 +317,12 @@ def main() -> None:
     except (json.JSONDecodeError, ValueError):
         return  # fail-open on parse error
 
+    if not isinstance(scan_result, dict):
+        # Valid JSON but not an object (null, a list, a bare string or a
+        # number) carries no verdict to act on — fail open, the same guard
+        # the qwen, qoder and cosh copies of this hook already carry.
+        return
+
     # 6. Mode-based output
     verdict = _safe_text(scan_result.get("verdict")) or "pass"
     findings = _as_list(scan_result.get("findings"))
