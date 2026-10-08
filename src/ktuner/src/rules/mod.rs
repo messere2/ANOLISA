@@ -446,7 +446,11 @@ fn eval_swappiness(
         || info.has_process("mariadbd")
         || info.has_process("mongod")
         || info.has_process("clickhouse")
-        || info.has_process("redis-server");
+        || info.has_process("redis-server")
+        // Valkey is the Linux Foundation's fork of Redis 7.2.4 - a drop-in
+        // `valkey-server` binary with the same event-loop, memory-resident
+        // cache workload, so the redis-server gates must count it too.
+        || info.has_process("valkey-server");
 
     let (target, reason) = if is_db
         || *workload == WorkloadType::IoLatency
@@ -492,6 +496,10 @@ fn eval_thp(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     // collapse/split stalls are exactly the latency spikes this rule heads
     // off, so a host running it must not be left on always.
     let is_latency_sensitive = info.has_process("redis-server")
+        // Valkey is the Linux Foundation's fork of Redis 7.2.4 - a drop-in
+        // `valkey-server` binary with the same event-loop, memory-resident
+        // cache workload, so the redis-server gates must count it too.
+        || info.has_process("valkey-server")
         || info.has_process("memcached")
         || info.has_process("postgres")
         || info.has_process("mysqld")
@@ -1818,7 +1826,12 @@ fn eval_overcommit_memory(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> 
     if !info.param_exists(path) {
         return 1;
     }
-    let needs_overcommit = info.has_process("redis-server");
+    // Valkey is the Linux Foundation's fork of Redis 7.2.4 - a drop-in
+    // `valkey-server` binary that carries the same startup warning
+    // ("WARNING overcommit_memory is set to 0! Background save may fail
+    // under low memory condition"), because fork-based RDB/AOF persistence
+    // is unchanged.
+    let needs_overcommit = info.has_process("redis-server") || info.has_process("valkey-server");
     if !needs_overcommit {
         return 1;
     }
@@ -1828,8 +1841,9 @@ fn eval_overcommit_memory(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> 
             param: "vm.overcommit_memory".to_string(),
             current_value: "0".to_string(),
             recommended_value: "1".to_string(),
-            reason: "Redis 使用 fork 进行 RDB/AOF 持久化，overcommit_memory=0 可能导致 fork 失败"
-                .to_string(),
+            reason:
+                "Redis/Valkey 使用 fork 进行 RDB/AOF 持久化，overcommit_memory=0 可能导致 fork 失败"
+                    .to_string(),
             confidence: Confidence::High,
             category: Category::Performance,
             writable: true,
@@ -3247,6 +3261,10 @@ fn eval_busy_poll_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &s
     }
     let current = read_sysctl_u64(path);
     let is_latency_sensitive = info.has_process("redis-server")
+        // Valkey is the Linux Foundation's fork of Redis 7.2.4 - a drop-in
+        // `valkey-server` binary with the same event-loop, memory-resident
+        // cache workload, so the redis-server gates must count it too.
+        || info.has_process("valkey-server")
         || info.has_process("memcached")
         || info.has_process("nginx")
         || info.has_process("postgres")
@@ -8854,6 +8872,24 @@ mod tests {
         let thp_rec = recs.iter().find(|r| r.param.contains("hugepage"));
         assert!(thp_rec.is_some());
         assert_eq!(thp_rec.unwrap().recommended_value, "madvise");
+    }
+
+    #[test]
+    fn test_thp_with_valkey() {
+        // Valkey is the Linux Foundation's fork of Redis 7.2.4 - a drop-in
+        // valkey-server binary with the same event-loop, memory-resident
+        // cache workload, so every redis-server gate must count it. An
+        // always-THP host running it must get the madvise recommendation.
+        let mut info = make_test_info();
+        info.processes = vec![ProcessInfo {
+            name: "valkey-server".to_string(),
+        }];
+        let recs = evaluate(&info).unwrap().recommendations;
+        let thp_rec = recs
+            .iter()
+            .find(|r| r.param.contains("hugepage"))
+            .unwrap_or_else(|| panic!("valkey-server must get the THP recommendation"));
+        assert_eq!(thp_rec.recommended_value, "madvise");
     }
 
     #[test]
