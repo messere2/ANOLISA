@@ -439,16 +439,6 @@ class OpenClawExternalAgent(BaseAgent):
                 _LOG_PREFIX, iteration, returncode, parsed_label,
             )
 
-            # Extract session_id from first call for context continuity.
-            if not oc_session_id and isinstance(parsed, dict):
-                agent_meta = (parsed.get("meta") or {}).get("agentMeta") or {}
-                oc_session_id = agent_meta.get("sessionId")
-                if oc_session_id:
-                    self.logger.info(
-                        "%s: session established (%s...)",
-                        _LOG_PREFIX, oc_session_id[:12],
-                    )
-
             if not parsed:
                 self.logger.debug(
                     "%s: stdout(first %d): %s",
@@ -483,6 +473,19 @@ class OpenClawExternalAgent(BaseAgent):
                         parsed, container_id, iteration, all_executions,
                     )
                     break
+
+            # Extract session_id for context continuity. This runs after
+            # the returncode handling so a successful retry also
+            # establishes the session for the following turns; failed
+            # calls never reach here (they break above).
+            if not oc_session_id and isinstance(parsed, dict):
+                agent_meta = (parsed.get("meta") or {}).get("agentMeta") or {}
+                oc_session_id = agent_meta.get("sessionId")
+                if oc_session_id:
+                    self.logger.info(
+                        "%s: session established (%s...)",
+                        _LOG_PREFIX, oc_session_id[:12],
+                    )
 
             # Extract commands from parsed response.
             commands = self._extract_commands(parsed)
@@ -929,6 +932,16 @@ class OpenClawExternalAgent(BaseAgent):
                     >= no_output_timeout_sec
                 ):
                     proc.kill()
+                    # Surface the guard reason in the returned stderr:
+                    # _run_agent_loop keys its one-retry policy on these
+                    # strings, and before this the reason only reached the
+                    # log, so a real no-output hang exited -9 immediately.
+                    stderr_chunks.append(
+                        (
+                            f"\n{_LOG_PREFIX}: no stdout for {no_output_timeout_sec}s "
+                            "(likely API hang)\n"
+                        ).encode("utf-8")
+                    )
                     _log.warning(
                         "%s: no stdout for %ds after %ds elapsed, "
                         "killing process (likely API hang)",
