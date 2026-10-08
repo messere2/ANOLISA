@@ -9,6 +9,7 @@ use opentelemetry::trace::{Status, TracerProvider as _};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider, SpanData};
 use serde_json::{Value, json};
 use std::{
+    io,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -58,11 +59,33 @@ async fn read(stream: UnixStream) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 async fn call(path: &Path, request: Value) -> Value {
-    let mut stream = UnixStream::connect(path).await.unwrap();
+    let mut stream = connect(path).await;
     let mut bytes = serde_json::to_vec(&request).unwrap();
     bytes.push(b'\n');
     stream.write_all(&bytes).await.unwrap();
     read(stream).await
+}
+
+/// Binding publishes the socket file slightly before the listener starts
+/// accepting, so the first connect after startup can still be refused;
+/// pap_protocol.rs documents the same window. A probe connection cannot
+/// wait the window out here because this suite runs with one connection
+/// slot and the probe would briefly hold it, so retry the refused connect
+/// instead.
+async fn connect(path: &Path) -> UnixStream {
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            match UnixStream::connect(path).await {
+                Ok(stream) => return stream,
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("connect failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("daemon socket never became connectable")
 }
 
 async fn wait_for_socket(path: &Path) {

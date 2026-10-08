@@ -131,12 +131,22 @@ async fn tracing_span_remains_open_after_dispatch_timeout_until_work_finishes() 
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+/// Binding publishes the socket file slightly before the listener starts
+/// accepting, so a path that already exists can still refuse connections;
+/// pap_protocol.rs documents the same window, which a busy multicore host
+/// hits deterministically. A successful probe connect is the only signal
+/// that proves reachability; it is closed at once and costs one of the 64
+/// default connection slots.
 async fn wait_for_socket(path: &std::path::Path) {
     tokio::time::timeout(Duration::from_secs(2), async {
-        while !path.exists() {
-            tokio::task::yield_now().await;
+        loop {
+            if let Ok(probe) = UnixStream::connect(path).await {
+                drop(probe);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("daemon should accept connections on its socket");
 }
