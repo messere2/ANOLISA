@@ -316,11 +316,17 @@ impl SkillFs {
             if m.is_staging_root(skill_name) {
                 return true;
             }
-            // H3: Hermes nested ID — check the leaf component.
-            if let Some(leaf) = skill_name.split('/').next_back() {
-                if leaf != skill_name {
-                    return m.is_staging_root(leaf);
-                }
+            // H3: Hermes nested ID — both components name a top-level
+            // directory of the workspace, so both are checked against the
+            // staging patterns. A PrefixStar pattern matches the whole ID
+            // through its category prefix, but an Exact pattern
+            // (".pip-staging" is a documented example) matches only the
+            // category; checking nothing but the leaf let a nested skill
+            // staged inside it escape the staging exemption (the hidden
+            // write gate, raw SKILL.md serving, and listing filters all
+            // route through this helper).
+            if skill_name.contains('/') {
+                return skill_name.split('/').any(|c| m.is_staging_root(c));
             }
             false
         })
