@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use super::broker;
 use super::command_risk::CommandShape;
 use super::command_risk_parser::{parse_command, SegmentConnector};
+use super::is_sensitive_target;
 use super::readonly_interceptor::build_interceptor_step;
 use super::readonly_pipeline::{
     error, limit_clean_text, wait_child_with_deadline, ReadonlyPipelineConfig,
@@ -136,12 +137,18 @@ pub(crate) fn build_readonly_compound_plan(command: &str) -> Option<ReadonlyComp
 
 /// Shared payload predicate for every plan step: readonly allowlist,
 /// no expansion markers, no context-observing or stdin-reading
-/// commands. The ponytail escape/comment rejection applies only on the
+/// commands, and no sensitive-target token (issue #6671): the plan
+/// builder is the single source of truth for both the assessment
+/// grant and the executor, so a path the simple-command gate routes
+/// to `AskUser` (`.env`, `id_rsa`, `/etc/shadow`, ...) can never enter
+/// an approval-free execution plan, compound or intercepted alike.
+/// The ponytail escape/comment rejection applies only on the
 /// stderr-suppressed path, where ambiguous tokens stay manual until
 /// the parser models them.
 pub(super) fn eligible_readonly_argv(argv: &[String], suppress_stderr: bool) -> bool {
     !argv.is_empty()
         && !argv.iter().any(|token| token.contains(['$', '`']))
+        && !argv.iter().any(|token| is_sensitive_target(token))
         && !(suppress_stderr
             && argv
                 .iter()

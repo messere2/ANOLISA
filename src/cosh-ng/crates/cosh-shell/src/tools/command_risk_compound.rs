@@ -47,8 +47,12 @@ pub(super) fn compound_segments(parsed: &ParsedCommand) -> Option<Vec<Vec<Vec<St
 /// The compound execution boundary is relaxed in exactly one case
 /// (issue #1882): a readonly-compound execution plan exists for the
 /// whole command (see `build_readonly_compound_plan`), granting
-/// `CompoundReadonly` evidence in auto mode. Every other compound keeps
-/// `AskUser`, never auto-allow. Assessment aggregation is unchanged.
+/// `CompoundReadonly` evidence in auto mode. The grant additionally
+/// requires the aggregated assessment to stay below `High` impact
+/// without a `sensitive-path` reason (issue #6671), so evidence can
+/// never outrank the sensitive-target approval contract. Every other
+/// compound keeps `AskUser`, never auto-allow. Assessment aggregation
+/// is unchanged.
 pub(super) fn assess_stripped_compound(
     command: &str,
     shape: CommandShape,
@@ -111,7 +115,16 @@ pub(super) fn assess_stripped_compound(
             reasons.insert(0, primary);
         }
     }
-    let auto_allow = compound_readonly_evidence(command).filter(|_| policy.auto_mode);
+    // Issue #6671: the evidence must not outrank the aggregated risk.
+    // A segment that reads a sensitive target evaluates to impact=High
+    // with a sensitive-path reason, and the compound aggregates both;
+    // no benign tail segment may convert that approval-gated read into
+    // an auto-executed command. Mirrors the readonly-pipeline grant,
+    // which likewise requires the aggregated verdict to stay safe
+    // before evidence can change the execution boundary.
+    let auto_allow = compound_readonly_evidence(command).filter(|_| {
+        policy.auto_mode && impact != RiskImpact::High && !reasons.contains(&"sensitive-path")
+    });
     if auto_allow.is_some() {
         // The whole compound is auto-executable; the structural
         // "not-auto-executable" reason no longer applies.

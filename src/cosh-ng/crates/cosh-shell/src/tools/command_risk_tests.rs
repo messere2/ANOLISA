@@ -1361,6 +1361,56 @@ fn compound_readonly_grant_preserves_aggregated_assessment_fields() {
     assert_eq!(allowed_rest, asked_rest);
 }
 
+#[test]
+fn compound_readonly_grant_fails_closed_on_sensitive_paths() {
+    // Issue #6671: a segment that reads a sensitive target evaluates
+    // to impact=High with a sensitive-path reason, and the aggregated
+    // compound carries both. The readonly-compound evidence must not
+    // outrank that verdict: appending a benign tail segment must not
+    // convert an approval-gated sensitive read into an auto-executed
+    // command in the default Auto mode.
+    for command in [
+        "cat .env && pwd",
+        "cat .env; pwd",
+        "cat .env || pwd",
+        "cat .env\npwd",
+        "cat '.env' && pwd",
+        "cat ~/.ssh/id_rsa && pwd",
+        "cat /etc/shadow || pwd",
+        "cat secret.pem && echo done",
+        "cat .netrc && pwd",
+        "tail -n 5 .bash_history && pwd",
+        "pwd && cat .env",
+        "df -h && cat id_ed25519",
+    ] {
+        let assessment = auto(command);
+        assert_eq!(
+            assessment.execution,
+            ExecutionDecision::AskUser,
+            "{command}"
+        );
+        assert!(assessment.auto_allow.is_none(), "{command}");
+        assert_eq!(assessment.impact, RiskImpact::High, "{command}");
+        assert!(
+            assessment.reasons.contains(&"sensitive-path"),
+            "{command}: {:?}",
+            assessment.reasons
+        );
+        assert!(
+            assessment
+                .side_effects
+                .contains(&SideEffectClass::SensitiveDataRead),
+            "{command}"
+        );
+        let policy = AutoExecutionPolicy::current_runtime();
+        assert_ne!(
+            policy.route(&assessment),
+            AutoExecutionRoute::CompoundReadonlyExecutor,
+            "{command}"
+        );
+    }
+}
+
 // ─── System-control (irrecoverable) command family, issue #2064 ─────
 
 #[test]
