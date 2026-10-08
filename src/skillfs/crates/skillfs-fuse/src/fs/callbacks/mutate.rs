@@ -221,8 +221,19 @@ impl SkillFs {
                         source_path: physical.join("SKILL.md"),
                         last_modified: std::time::SystemTime::now(),
                     };
-                    self.store.write().upsert(placeholder);
-                    debug!(name = %skill_name, "mkdir: inserted placeholder into store");
+                    match self.store.write().upsert_checked(placeholder) {
+                        None => {
+                            debug!(name = %skill_name, "mkdir: inserted placeholder into store");
+                        }
+                        Some(error) => {
+                            warn!(
+                                name = %skill_name,
+                                dropped = %error.path.display(),
+                                "mkdir: duplicate skill name — kept the lexicographically \
+                                 smaller source path"
+                            );
+                        }
+                    }
                 }
 
                 // D1.3-demo: a fresh skill dir or a sub-dir under an
@@ -1662,7 +1673,19 @@ impl SkillFs {
     /// skill to a non-conforming directory (e.g. `foo_bar`) degrades the
     /// entry exactly like the initial scan would, instead of inserting a
     /// cleanly parsed entry under an illegal name.
-    fn update_store_after_skill_rename(&self, old_name: &str, new_name: &str, new_physical: &Path) {
+    ///
+    /// The insert goes through `SkillStore::upsert_checked`: when the new
+    /// leaf name is already owned by a skill in a different directory, the
+    /// loaders' collision rule decides the winner — the store then matches
+    /// what a fresh discovery scan of the same tree would produce — and the
+    /// loser is reported (and logged) instead of being silently
+    /// overwritten. The collision report is returned to the caller.
+    fn update_store_after_skill_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        new_physical: &Path,
+    ) -> Option<skillfs_core::store::LoadError> {
         self.store.write().remove(old_name);
         let md_path = new_physical.join("SKILL.md");
         let mut new_entry = match parser::parse_skill_file(&md_path) {
@@ -1685,7 +1708,15 @@ impl SkillFs {
             }
         };
         adopt_directory_name(&mut new_entry, new_name);
-        self.store.write().upsert(new_entry);
+        let collision = self.store.write().upsert_checked(new_entry);
+        if let Some(error) = &collision {
+            warn!(
+                name = %new_name,
+                dropped = %error.path.display(),
+                "rename: duplicate skill name — kept the lexicographically smaller source path"
+            );
+        }
+        collision
     }
 
     /// Whether the store entry keyed by `skill_name` demonstrably
@@ -1919,6 +1950,94 @@ mod tests {
                 if msg.contains("awaiting SKILL.md") && msg.contains("foo_bar")),
             "placeholder must merge the directory-name issue, got {:?}",
             entry.parse_status
+        );
+    }
+
+    #[test]
+    fn rename_onto_another_directorys_leaf_keeps_the_discovery_winner() {
+        // ee514e2b4 ("surface cross-category name clashes") made same-leaf
+        // collisions loud at discovery: the lexicographically smaller source
+        // path keeps the key and the loser is reported as a LoadError. The
+        // rename store sync inserts with a blind upsert, so renaming a skill
+        // onto another directory's leaf name silently steals that key — the
+        // shadowed skill vanishes from /skills, sls list/validate, and
+        // skill-discover, and the live store diverges from what a remount
+        // would re-discover.
+        let source = tempfile::tempdir().expect("source tempdir");
+        write_skill(&source.path().join("apple/notes"), "notes");
+        write_skill(&source.path().join("banana/alpha"), "alpha");
+
+        let mut store = SkillStore::new();
+        store.load_from_directory(source.path(), &ParseConfig::default());
+        assert_eq!(
+            store.get("notes").expect("discovered").source_path,
+            source.path().join("apple/notes/SKILL.md")
+        );
+
+        let shared = Arc::new(RwLock::new(store));
+        let fs = SkillFs::new(
+            source.path().join("mount"),
+            source.path().to_path_buf(),
+            shared.clone(),
+            false,
+        );
+
+        // The physical rename already happened: alpha's directory (its
+        // manifest not yet updated) now sits at banana/notes.
+        write_skill(&source.path().join("banana/notes"), "alpha");
+
+        fs.update_store_after_skill_rename("alpha", "notes", &source.path().join("banana/notes"));
+
+        let guard = shared.read();
+        assert!(guard.get("alpha").is_none(), "old store key removed");
+        assert_eq!(
+            guard.get("notes").expect("colliding key").source_path,
+            source.path().join("apple/notes/SKILL.md"),
+            "the discovery winner must keep the key: a rename onto another \
+             directory's leaf name must not silently steal it"
+        );
+    }
+
+    #[test]
+    fn rename_onto_another_directorys_leaf_reports_the_stolen_name() {
+        // The mirror direction of the collision rule: the renamed skill's
+        // source path is lexicographically smaller, so it takes the key —
+        // the same winner a remount would re-discover — but the collision
+        // must be reported, never silent.
+        let source = tempfile::tempdir().expect("source tempdir");
+        write_skill(&source.path().join("zeta/notes"), "notes");
+        write_skill(&source.path().join("apple/alpha"), "alpha");
+
+        let mut store = SkillStore::new();
+        store.load_from_directory(source.path(), &ParseConfig::default());
+
+        let shared = Arc::new(RwLock::new(store));
+        let fs = SkillFs::new(
+            source.path().join("mount"),
+            source.path().to_path_buf(),
+            shared.clone(),
+            false,
+        );
+
+        write_skill(&source.path().join("apple/notes"), "alpha");
+
+        let report = fs.update_store_after_skill_rename(
+            "alpha",
+            "notes",
+            &source.path().join("apple/notes"),
+        );
+
+        let guard = shared.read();
+        assert_eq!(
+            guard.get("notes").expect("winner").source_path,
+            source.path().join("apple/notes/SKILL.md"),
+            "the lexicographically smaller renamed skill wins the key"
+        );
+        let report = report.expect("collision report");
+        assert!(
+            report.error.contains("duplicate skill name 'notes'"),
+            "report must name the duplicate, got: {}",
+            report.error
         );
     }
 

@@ -66,7 +66,14 @@ pub(crate) fn spawn_sync_worker(
                                     name = %skill_name,
                                     "sync: re-parsed SKILL.md"
                                 );
-                                store.write().upsert(entry);
+                                if let Some(error) = store.write().upsert_checked(entry) {
+                                    warn!(
+                                        name = %skill_name,
+                                        dropped = %error.path.display(),
+                                        "sync: duplicate skill name — kept the \
+                                         lexicographically smaller source path"
+                                    );
+                                }
                             }
                             Err(e) => {
                                 warn!(
@@ -121,6 +128,61 @@ mod tests {
         assert_eq!(entry.metadata.name, "demo");
         assert_eq!(entry.source_path, md_path);
         assert!(entry.body.contains("updated body"));
+    }
+
+    #[test]
+    fn reparse_of_a_colliding_leaf_keeps_the_discovery_winner() {
+        // The sync worker re-parses SKILL.md on write events and inserts
+        // the entry under the event's bare leaf name. When a different
+        // directory shares that leaf, the blind upsert silently steals the
+        // discovered skill's store key — the same collision the loaders
+        // report (ee514e2b4), which must be decided by the same rule here.
+        let source = tempfile::tempdir().expect("source tempdir");
+        let winner_md = source.path().join("apple/notes/SKILL.md");
+        std::fs::create_dir_all(winner_md.parent().expect("skill parent"))
+            .expect("category skill dir");
+        std::fs::write(
+            &winner_md,
+            "---\nname: notes\ndescription: from apple\n---\nbody\n",
+        )
+        .expect("discovered SKILL.md");
+
+        let mut store = SkillStore::new();
+        store.load_from_directory(source.path(), &skillfs_core::ParseConfig::default());
+        assert_eq!(
+            store.get("notes").expect("discovered").source_path,
+            winner_md
+        );
+
+        // A different directory with the same leaf appears later (a write
+        // through the mount lands here as a Reparse event).
+        let loser_md = source.path().join("banana/notes/SKILL.md");
+        std::fs::create_dir_all(loser_md.parent().expect("skill parent"))
+            .expect("colliding skill dir");
+        std::fs::write(
+            &loser_md,
+            "---\nname: notes\ndescription: from banana\n---\nbody\n",
+        )
+        .expect("colliding SKILL.md");
+
+        let shared = Arc::new(RwLock::new(store));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = spawn_sync_worker(rx, shared.clone());
+        tx.send(SyncEvent::Reparse {
+            skill_name: "notes".to_string(),
+            source_path: loser_md,
+        })
+        .expect("send reparse");
+        drop(tx);
+        worker.join().expect("sync worker");
+
+        let guard = shared.read();
+        assert_eq!(
+            guard.get("notes").expect("key still held").source_path,
+            winner_md,
+            "a re-parse of a different directory with the same leaf must \
+             not silently steal the store key"
+        );
     }
 
     #[test]
