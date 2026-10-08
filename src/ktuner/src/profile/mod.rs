@@ -45,6 +45,10 @@ pub fn classify(info: &SystemInfo) -> WorkloadType {
         || info.has_process("tidb-server")
         || info.has_process("tikv-server")
         || info.has_process("mongod")
+        // oracle is the archetypal OLTP database — the io-latency
+        // profile's own definition. A host running it classified as
+        // mixed before the gate learned its name.
+        || info.has_process("oracle")
         || info.has_process("clickhouse");
     let has_cache = info.has_process("redis-server")
         || info.has_process("memcached")
@@ -143,6 +147,17 @@ mod tests {
         );
         assert_eq!(
             classify(&make_info(vec!["mongod"])),
+            WorkloadType::IoLatency
+        );
+    }
+
+    #[test]
+    fn test_classify_oracle() {
+        // The io-latency profile is defined as "OLTP databases, KV stores" —
+        // oracle is the archetypal OLTP database, so a host running it must
+        // not classify as mixed.
+        assert_eq!(
+            classify(&make_info(vec!["oracle"])),
             WorkloadType::IoLatency
         );
     }

@@ -446,6 +446,10 @@ fn eval_swappiness(
         || info.has_process("mariadbd")
         || info.has_process("mongod")
         || info.has_process("clickhouse")
+        // oracle completes the OLTP set the THP rule already counts it
+        // in: MOS 2099693.1 pins vm.swappiness=1 on database servers —
+        // exactly this rule's target for the class.
+        || info.has_process("oracle")
         || info.has_process("redis-server");
 
     let (target, reason) = if is_db
@@ -526,7 +530,10 @@ fn eval_dirty_ratio(
         // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
         || info.has_process("mariadbd")
         || info.has_process("mongod")
-        || info.has_process("clickhouse");
+        || info.has_process("clickhouse")
+        // the same OLTP set: oracle is the one database
+        // is_database_present counts that this list still skipped.
+        || info.has_process("oracle");
     let is_latency_sensitive = is_db || *workload == WorkloadType::IoLatency;
 
     // dirty_ratio and dirty_bytes are mutually exclusive in the kernel (setting
@@ -1817,7 +1824,10 @@ fn eval_read_ahead_kb(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usiz
         // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
         || info.has_process("mariadbd")
         || info.has_process("mongod")
-        || info.has_process("clickhouse");
+        || info.has_process("clickhouse")
+        // the same OLTP set the dirty and NUMA rules count: random IO on
+        // SSD/NVMe dominates for Oracle exactly as for the sibling DBs.
+        || info.has_process("oracle");
 
     for disk in &info.disks {
         match disk.disk_type {
@@ -1914,7 +1924,11 @@ fn eval_numa_balancing_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, pat
         // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
         || info.has_process("mariadbd")
         || info.has_process("mongod")
-        || info.has_process("clickhouse");
+        || info.has_process("clickhouse")
+        // Oracle 12.2+ disables automatic NUMA balancing itself at
+        // instance startup (MOS 2060885.1): the kernel's page-migration
+        // stalls are exactly the latency this rule heads off.
+        || info.has_process("oracle");
     if !is_db {
         return 1;
     }
@@ -3192,7 +3206,9 @@ fn eval_dirty_background_ratio_at(
             // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
             || info.has_process("mariadbd")
             || info.has_process("mongod")
-            || info.has_process("clickhouse");
+            || info.has_process("clickhouse")
+            // the same OLTP set the dirty_ratio sibling now counts.
+            || info.has_process("oracle");
         if has_db || matches!(workload, WorkloadType::IoLatency) || current > 10 {
             recs.push(Recommendation {
                 param: "vm.dirty_background_ratio".to_string(),
@@ -7366,6 +7382,88 @@ mod tests {
                 .any(|r| r.param == "block/nvme0n1/read_ahead_kb"),
             "mariadbd must gate the read-ahead rule in"
         );
+    }
+
+    #[test]
+    fn oracle_gates_the_database_tuning_rules() {
+        // The completion of the THP rule's oracle gate (64bd828e0): every
+        // sibling database list — swappiness, the dirty family, NUMA
+        // balancing, the readahead rule, the profile classifier — still
+        // skipped the one OLTP database is_database_present already counts.
+        // Oracle's own guidance matches the targets: vm.swappiness=1
+        // (MOS 2099693.1) and NUMA balancing off (MOS 2060885.1 — Oracle
+        // 12.2+ disables it at instance startup itself).
+        let mut info = info_with_processes(&["oracle"]);
+        // Below the >=64GB branch of the swappiness and dirty rules, so only
+        // the database gate can produce a recommendation here.
+        info.memory_total_gb = 32;
+        info.disks[0].disk_type = DiskType::NVMe;
+        info.disks[0].read_ahead_kb = 512;
+
+        let mut recs = Vec::new();
+        eval_swappiness(&info, &WorkloadType::Mixed, &mut recs);
+        let swap_rec = recs
+            .iter()
+            .find(|r| r.param == "vm.swappiness")
+            .unwrap_or_else(|| panic!("oracle must gate the swappiness rule in"));
+        assert_eq!(swap_rec.recommended_value, "1");
+
+        let mut recs = Vec::new();
+        eval_dirty_ratio(&info, &WorkloadType::Mixed, &mut recs);
+        assert!(
+            recs.iter().any(|r| r.param == "vm.dirty_ratio"),
+            "oracle must gate the dirty_ratio rule in"
+        );
+
+        let mut recs = Vec::new();
+        eval_read_ahead_kb(&info, &mut recs);
+        let ra_rec = recs
+            .iter()
+            .find(|r| r.param.contains("read_ahead_kb"))
+            .unwrap_or_else(|| panic!("oracle must gate the readahead rule in"));
+        assert_eq!(ra_rec.recommended_value, "128");
+    }
+
+    #[test]
+    fn oracle_gates_the_numa_and_background_rules() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_oracle_gates_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, content: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let numa_balancing = write("numa_balancing", "1\n");
+        let dirty_background_ratio = write("dirty_background_ratio", "10\n");
+
+        let mut info = info_with_processes(&["oracle"]);
+        info.memory_total_gb = 32;
+        info.numa_nodes = 2;
+
+        let mut recs = Vec::new();
+        eval_numa_balancing_at(&info, &mut recs, numa_balancing.to_str().unwrap());
+        assert!(
+            recs.iter().any(|r| r.param == "kernel.numa_balancing"),
+            "oracle must gate the numa_balancing rule in"
+        );
+
+        let mut recs = Vec::new();
+        eval_dirty_background_ratio_at(
+            &info,
+            &WorkloadType::Mixed,
+            &mut recs,
+            dirty_background_ratio.to_str().unwrap(),
+        );
+        assert!(
+            recs.iter().any(|r| r.param == "vm.dirty_background_ratio"),
+            "oracle must gate the dirty_background_ratio rule in"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
