@@ -292,22 +292,58 @@ impl<R: RecordRepository, P: FaultPolicy<Record = R::Record>> SqliteSink<R, P> {
         if !self.store.is_open() {
             return;
         }
-        let _ = run_sqlite_maintenance_if_due(self.store.path(), None, Some(now), || {
-            self.run_maintenance(now);
-            Ok(())
-        });
+        // A failed final pass leaves the gate open, so the next start's
+        // catch-up retries instead of waiting out the interval.
+        let _ = self.maintain(now);
         self.store.close();
     }
 
-    /// Prunes according to the retention window and truncates the WAL.
-    pub fn run_maintenance(&self, now: f64) {
-        let _ = self.store.with_connection(false, |conn| {
-            if let Some(days) = self.max_age_days {
-                self.repository.prune(conn, days, now)?;
-            }
-            self.repository.checkpoint(conn);
-            Ok(())
+    /// Runs the gated maintenance pass, keeping the connection for writes.
+    ///
+    /// This is the entry point for a long-lived process that cannot wait for
+    /// its own exit: the host schedules it at startup and on a tick.
+    ///
+    /// Returns `Ok(true)` when a due pass ran and the marker advanced, and
+    /// `Ok(false)` when nothing ran (not due, never opened, or another process
+    /// holds the gate lock).
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure's description when a due pass failed: the marker is
+    /// left untouched so the next call retries at the caller's cadence instead
+    /// of waiting out the full interval.
+    pub fn maintain(&self, now: f64) -> Result<bool, String> {
+        if !self.store.is_open() {
+            return Ok(false);
+        }
+        let mut failure = None;
+        let ran = run_sqlite_maintenance_if_due(self.store.path(), None, Some(now), || {
+            self.run_maintenance(now)
+                .inspect_err(|error| failure = Some(error.to_string()))
         });
+        match failure {
+            Some(reason) => Err(reason),
+            None => Ok(ran),
+        }
+    }
+
+    /// Prunes according to the retention window and truncates the WAL.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fault that stopped pruning; the checkpoint stays
+    /// best-effort, as in v1. Whether the fault is reported or swallowed is
+    /// the caller's policy.
+    pub fn run_maintenance(&self, now: f64) -> Result<(), KernelError> {
+        self.store
+            .with_connection(false, |conn| {
+                if let Some(days) = self.max_age_days {
+                    self.repository.prune(conn, days, now)?;
+                }
+                self.repository.checkpoint(conn);
+                Ok(())
+            })
+            .map(|_| ())
     }
 }
 

@@ -208,7 +208,7 @@ rather than merely that a warning was logged.
 | `ensure_schema_if_needed_runs_full_schema_when_version_mismatch` | 1:1 | `v1_fixtures::a_revision_one_database_converges_to_the_current_schema` |
 | `sqlite_schema_error_classification_uses_message` | 1:1 | `error::tests::schema_detection_uses_code_then_markers` |
 | `sqlite_store_reuses_session_factory_across_repositories` | merged | `store::tests::writable_store_caches_the_connection` |
-| `security_event_prune_disposes_store_on_sqlalchemy_error` | moved | `security_events::writer::tests::a_failing_retention_pass_is_swallowed_and_still_marks_the_gate` — v2 does not dispose, and the divergence is deliberate (D-25). |
+| `security_event_prune_disposes_store_on_sqlalchemy_error` | moved | `security_events::writer::tests::a_failing_retention_pass_keeps_the_gate_open_for_an_earlier_retry` — v2 does not dispose, and the divergence is deliberate (D-25); a failed pass now leaves the maintenance gate open. |
 | `write_store_returns_checked_session_factory_if_cache_is_cleared` | merged | `store::tests::writable_store_caches_the_connection` |
 | `request_schema_repair_is_preserved_during_concurrent_open` | 1:1 | `store::tests::repair_request_forces_convergence_and_survives_until_used` |
 | `readonly_store_does_not_create_missing_db` | split | `store::tests::read_only_store_never_creates_the_database`, `connection::tests::read_only_open_fails_for_a_missing_file` |
@@ -584,7 +584,7 @@ Beyond v1: `observability::reader::tests::a_reader_over_a_missing_database_retur
 | v1 case | Mode | v2 test |
 |---|---|---|
 | `retention_prunes_by_observed_at_epoch` | 1:1 | `observability_store::retention_prunes_by_observed_at_epoch` |
-| `observability_prune_disposes_store_on_sqlalchemy_error` | moved | `observability::writer::tests::a_failing_retention_pass_is_swallowed_and_still_marks_the_gate` — v2 does not dispose; see D-25. |
+| `observability_prune_disposes_store_on_sqlalchemy_error` | moved | `observability::writer::tests::a_failing_retention_pass_keeps_the_gate_open_for_an_earlier_retry` — v2 does not dispose; see D-25. A failed pass now leaves the maintenance gate open. |
 
 ## Gaps closed while writing this ledger
 

@@ -112,6 +112,28 @@ impl ObservabilitySqliteWriter {
     pub fn close_at(&self, now: f64) {
         self.sink.close(now);
     }
+
+    /// Runs the gated maintenance pass as of `now`, keeping the store open.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure description when a due pass fails. The gate marker
+    /// is not advanced, so the next call retries at the caller's cadence.
+    pub fn maintain_at(&self, now: f64) -> Result<bool, String> {
+        self.sink.maintain(now)
+    }
+
+    /// Runs the gated maintenance pass, keeping the store open.
+    ///
+    /// Uses the current wall clock; [`ObservabilitySqliteWriter::maintain_at`]
+    /// takes an injected time for deterministic tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure description when a due pass fails.
+    pub fn maintain(&self) -> Result<bool, String> {
+        self.maintain_at(current_epoch())
+    }
 }
 
 /// Failure of a default-path constructor.
@@ -208,15 +230,16 @@ mod tests {
         assert!(writer.write_or_raise(&record()).is_err());
     }
 
-    /// A failing retention pass stays silent and still advances the gate.
+    /// A failing retention pass leaves the gate open for an earlier retry.
     ///
     /// v1's `prune` catches `SQLAlchemyError` and disposes the engine so the
     /// next write reconnects. v2 keeps its cached connection, because a
-    /// `rusqlite` connection stays usable after a failed statement (see D-25).
-    /// What both versions share, and what this pins, is that the failure never
-    /// reaches the caller and never blocks the rest of the close path.
+    /// `rusqlite` connection stays usable after a failed statement (see D-25;
+    /// that no-dispose divergence is unchanged). Either way a failed pass must
+    /// not advance the success marker: the next close or scheduled pass has to
+    /// find the gate still open, which is what this pins.
     #[test]
-    fn a_failing_retention_pass_is_swallowed_and_still_marks_the_gate() {
+    fn a_failing_retention_pass_keeps_the_gate_open_for_an_earlier_retry() {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join("observability.db");
         let writer = ObservabilitySqliteWriter::new(&path).expect("writer");
@@ -233,8 +256,24 @@ mod tests {
 
         assert!(!writer.sink().store().is_open());
         assert!(
-            dir.path().join("observability.db.maintenance").exists(),
-            "the gate must record the attempt even when pruning failed"
+            !dir.path().join("observability.db.maintenance").exists(),
+            "a failed pass must leave the gate open for an earlier retry"
         );
+
+        // The gate is still due at the next attempt: the retry a following
+        // close or scheduled pass would make runs immediately and can record
+        // success.
+        let mut retry_ran = false;
+        assert!(asc_sqlite_kernel::run_sqlite_maintenance_if_due(
+            &path,
+            None,
+            Some(1002.0),
+            || {
+                retry_ran = true;
+                Ok(())
+            }
+        ));
+        assert!(retry_ran);
+        assert!(dir.path().join("observability.db.maintenance").exists());
     }
 }

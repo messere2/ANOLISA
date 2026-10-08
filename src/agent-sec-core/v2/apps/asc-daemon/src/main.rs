@@ -1,3 +1,4 @@
+mod retention;
 mod runtime_path;
 mod skill_sec;
 
@@ -160,6 +161,12 @@ async fn run(
     telemetry
         .report("agent-sec-daemon: warning: PAP state is process-local and is lost on restart");
 
+    // Retention now runs from the daemon's own lifecycle: one catch-up pass at
+    // startup, then a periodic re-check of the daily gate. The graceful-exit
+    // close() below stays as the bounded final pass.
+    let retention_task =
+        retention::spawn_retention_service(Arc::clone(&event_sinks), telemetry.reporter());
+
     let shutdown = ShutdownToken::new();
     let health_task = policy_runtime
         .as_ref()
@@ -173,6 +180,7 @@ async fn run(
     )
     .await;
     signal_task.abort();
+    retention_task.abort();
     if let Some(health_task) = health_task {
         health_task.abort();
     }

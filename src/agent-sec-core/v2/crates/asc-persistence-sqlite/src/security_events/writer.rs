@@ -132,6 +132,29 @@ impl<S: DropSink> SqliteEventWriter<S> {
     pub fn close_at(&self, now: f64) {
         self.sink.close(now);
     }
+
+    /// Runs the gated maintenance pass, keeping the store open for writes.
+    ///
+    /// The daemon schedules this at startup and on a tick; the graceful-exit
+    /// [`SqliteEventWriter::close`] remains the bounded final pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure description when a due pass fails. The gate marker
+    /// is not advanced, so the next call retries at the caller's cadence.
+    pub fn maintain(&self) -> Result<bool, String> {
+        self.maintain_at(current_epoch())
+    }
+
+    /// Runs the gated maintenance pass as of `now`, keeping the store open.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure description when a due pass fails; see
+    /// [`SqliteEventWriter::maintain`].
+    pub fn maintain_at(&self, now: f64) -> Result<bool, String> {
+        self.sink.maintain(now)
+    }
 }
 
 /// Failure of a default-path constructor.
@@ -248,16 +271,16 @@ mod tests {
         assert_eq!(writer.sink().max_age_days(), None);
     }
 
-    /// A failing retention pass stays silent and still advances the gate.
+    /// A failing retention pass leaves the gate open for an earlier retry.
     ///
     /// v1's `prune` catches `SQLAlchemyError` and disposes the engine so the
     /// next write reconnects. v2 keeps its cached connection: a `rusqlite`
     /// connection remains usable after a failed statement, so there is nothing
-    /// to rebuild (see D-25). What both versions share, and what this pins, is
-    /// that the failure never reaches the caller and never blocks the rest of
-    /// the close path.
+    /// to rebuild (see D-25; that no-dispose divergence is unchanged). Either
+    /// way a failed pass must not advance the success marker: the next close or
+    /// scheduled pass has to find the gate still open, which is what this pins.
     #[test]
-    fn a_failing_retention_pass_is_swallowed_and_still_marks_the_gate() {
+    fn a_failing_retention_pass_keeps_the_gate_open_for_an_earlier_retry() {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join("events.db");
         let writer = SqliteEventWriter::new(&path).expect("writer");
@@ -274,8 +297,57 @@ mod tests {
 
         assert!(!writer.sink().store().is_open());
         assert!(
-            dir.path().join("events.db.maintenance").exists(),
-            "the gate must record the attempt even when pruning failed"
+            !dir.path().join("events.db.maintenance").exists(),
+            "a failed pass must leave the gate open for an earlier retry"
         );
+
+        // The gate is still due at the next attempt: the retry a following
+        // close or scheduled pass would make runs immediately and can record
+        // success.
+        let mut retry_ran = false;
+        assert!(asc_sqlite_kernel::run_sqlite_maintenance_if_due(
+            &path,
+            None,
+            Some(1002.0),
+            || {
+                retry_ran = true;
+                Ok(())
+            }
+        ));
+        assert!(retry_ran);
+        assert!(dir.path().join("events.db.maintenance").exists());
+    }
+
+    #[test]
+    fn maintain_prunes_on_a_schedule_without_closing_the_store() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("events.db");
+        let writer = SqliteEventWriter::new(&path).expect("writer");
+        let mut aged = event("e1");
+        aged.set_timestamp("2026-01-01T00:00:00+00:00")
+            .expect("old timestamp");
+        writer.write(&aged);
+
+        // The first due pass runs and advances the marker, and the store stays
+        // open for further writes — this is the pass a long-lived process
+        // schedules instead of waiting for its own exit.
+        let start = current_epoch();
+        assert_eq!(writer.maintain_at(start), Ok(true));
+        assert!(writer.sink().store().is_open());
+        let conn = rusqlite::Connection::open(&path).expect("open");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM security_events", [], |row| row.get(0))
+            .expect("count rows");
+        assert_eq!(count, 0, "the due pass must prune the aged record");
+        drop(conn);
+
+        // Inside the gate interval a second pass is a no-op.
+        assert_eq!(writer.maintain_at(start + 1500.0), Ok(false));
+
+        // Thirty-one days later the pass is due again.
+        let later = start + 31.0 * 86_400.0;
+        assert_eq!(writer.maintain_at(later), Ok(true));
+        writer.close_at(later);
+        assert!(!writer.sink().store().is_open());
     }
 }

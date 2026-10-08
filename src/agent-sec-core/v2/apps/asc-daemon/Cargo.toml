@@ -51,6 +51,7 @@ tokio.workspace = true
 [dev-dependencies]
 asc-action-runtime = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
+rusqlite.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-opentelemetry.workspace = true

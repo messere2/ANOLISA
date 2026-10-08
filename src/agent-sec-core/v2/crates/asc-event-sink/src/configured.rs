@@ -117,6 +117,22 @@ impl ConfiguredSecurityEventSinks {
         }
     }
 
+    /// Runs gated `SQLite` retention without closing the writer.
+    ///
+    /// The long-running daemon calls this at startup and on a schedule; the
+    /// outcome mirrors [`SqliteEventWriter::maintain`] so a failed pass reaches
+    /// diagnostics while the gate stays open for an earlier retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure description when a due maintenance pass fails.
+    pub fn maintain(&self) -> Result<bool, String> {
+        match self.sqlite.peek() {
+            Some(writer) => writer.maintain(),
+            None => Ok(false),
+        }
+    }
+
     fn sqlite_writer(&self) -> Result<Arc<SqliteEventWriter>, SinkError> {
         self.sqlite
             .get_or_try_init(|| Ok(SqliteEventWriter::new(&self.sqlite_path)?))
@@ -182,5 +198,26 @@ mod tests {
         sinks.warm_jsonl().expect("warm independent jsonl");
         assert!(sinks.warm_sqlite().is_err());
         assert!(jsonl.exists());
+    }
+
+    #[test]
+    fn maintain_runs_the_gate_without_closing_the_writer() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let jsonl = dir.path().join("events.jsonl");
+        let sinks = ConfiguredSecurityEventSinks::new(jsonl.clone(), dir.path().join("events.db"));
+        sinks.warm_sqlite().expect("warm sqlite");
+
+        assert_eq!(sinks.maintain(), Ok(true));
+        assert!(dir.path().join("events.db.maintenance").exists());
+
+        // Inside the gate interval a second pass is a no-op, and the writer
+        // stays usable for further events.
+        assert_eq!(sinks.maintain(), Ok(false));
+        sinks.log_event(&SecurityEvent::new("code_scan", "code_scan", Map::new()));
+        sinks.close();
+        assert_eq!(
+            fs::read_to_string(&jsonl).expect("jsonl").lines().count(),
+            1
+        );
     }
 }
