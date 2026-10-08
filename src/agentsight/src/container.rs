@@ -207,10 +207,13 @@ pub fn path_on_overlayfs(path: &Path) -> bool {
     // mounted volume, and matching the unresolved path would false-positive.
     // Fall back to the raw path when the directory does not exist yet.
     let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+    // Read the raw bytes: one mount line carrying raw non-UTF-8 bytes (the
+    // kernel passes them through) would fail `read_to_string` wholesale and
+    // blind the scan for every other mount.
+    let Ok(mounts) = std::fs::read("/proc/self/mounts") else {
         return false;
     };
-    path_on_overlayfs_in(&resolved, &mounts)
+    path_on_overlayfs_bytes(&resolved, &mounts)
 }
 
 /// Warn when the data directory sits on non-persistent storage.
@@ -231,33 +234,86 @@ pub fn warn_if_data_dir_not_persistent(dir: &Path) {
     }
 }
 
-/// Evaluate a mount table (the text of `/proc/self/mounts`) for
-/// [`path_on_overlayfs`]; kept separate so tests do not depend on the host.
-fn path_on_overlayfs_in(path: &Path, mounts: &str) -> bool {
-    let target = path.to_string_lossy();
+/// Evaluate a mount table (the bytes of `/proc/self/mounts`) for
+/// [`path_on_overlayfs`]; byte-level so tests do not depend on the host and
+/// a mount line with raw non-UTF-8 bytes stays representable.
+fn path_on_overlayfs_bytes(path: &Path, mounts: &[u8]) -> bool {
+    // Compare the query path's own bytes: a lossy rendering would conflate a
+    // mounted `/mnt/<raw 0xff>` with a queried `/mnt/U+FFFD`.
+    let target = path.as_os_str().as_encoded_bytes();
     let mut best_len = 0usize;
     let mut overlay = false;
-    for line in mounts.lines() {
-        // Format: <src> <mountpoint> <fstype> <options> <dump> <pass>
-        let mut fields = line.split_whitespace();
+    for line in mounts.split(|&b| b == b'\n') {
+        // Format: <src> <mountpoint> <fstype> <options> <dump> <pass>. The
+        // kernel octal-escapes the four whitespace/backslash bytes in path
+        // fields precisely so the fields stay whitespace-delimited.
+        let mut fields = line
+            .split(|&b| b == b' ' || b == b'\t')
+            .filter(|field| !field.is_empty());
         let (Some(_src), Some(mount_point), Some(fstype)) =
             (fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
-        // The kernel octal-escapes spaces (and other specials) as \040.
-        let mount_point = mount_point.replace("\\040", " ");
-        let is_prefix = target == mount_point
-            || target.starts_with(&format!("{mount_point}/"))
-            || mount_point == "/";
+        // The kernel octal-escapes exactly four bytes in path fields —
+        // space (\040), tab (\011), newline (\012), backslash (\134) — and
+        // passes every other byte through raw, including non-UTF-8 bytes.
+        // Decode at the byte level (malformed escapes kept verbatim, never
+        // guessed) so a mount point carrying any of the four still matches.
+        let mount_point = unescape_mount_field(mount_point);
+        let is_prefix = target == mount_point.as_slice()
+            || mount_point.as_slice() == b"/"
+            || (target.len() > mount_point.len()
+                && target[..mount_point.len()] == mount_point[..]
+                && target[mount_point.len()] == b'/');
         // Longest prefix wins; on ties the later entry wins, because stacked
         // mounts list the effective (most recently stacked) mount last.
         if is_prefix && mount_point.len() >= best_len {
             best_len = mount_point.len();
-            overlay = fstype == "overlay";
+            overlay = fstype == b"overlay".as_slice();
         }
     }
     best_len > 0 && overlay
+}
+
+/// Evaluate a UTF-8 mount table (the text of `/proc/self/mounts`) for
+/// [`path_on_overlayfs`]; kept separate so tests do not depend on the host.
+fn path_on_overlayfs_in(path: &Path, mounts: &str) -> bool {
+    path_on_overlayfs_bytes(path, mounts.as_bytes())
+}
+
+/// Decode the kernel's octal escapes in one `/proc/mounts` path field.
+///
+/// The kernel escapes exactly four bytes — space (`\040`), tab (`\011`),
+/// newline (`\012`), backslash (`\134`) — and passes everything else through
+/// raw, including non-UTF-8 bytes. Malformed escape tails are kept verbatim,
+/// never guessed.
+fn unescape_mount_field(field: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(field.len());
+    let mut i = 0;
+    while i < field.len() {
+        if field[i] == b'\\' && i + 3 < field.len() {
+            if let Some(value) = decode_octal_triple(&field[i + 1..i + 4]) {
+                out.push(value);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(field[i]);
+        i += 1;
+    }
+    out
+}
+
+fn decode_octal_triple(digits: &[u8]) -> Option<u8> {
+    let mut value: u16 = 0;
+    for &digit in digits {
+        if !digit.is_ascii_digit() || digit > b'7' {
+            return None;
+        }
+        value = value * 8 + u16::from(digit - b'0');
+    }
+    u8::try_from(value).ok()
 }
 
 #[cfg(test)]
@@ -306,6 +362,58 @@ mod tests {
             "ext4 bind mount must win over the overlay root"
         );
         assert!(path_on_overlayfs_in(Path::new("/other"), spaced));
+    }
+
+    #[test]
+    fn overlayfs_detects_tab_escaped_mount_points() {
+        // The kernel octal-escapes tabs in mount point fields too (\011):
+        // only \040 used to be decoded, so an overlay mounted at a path
+        // containing a tab (or a newline, or a backslash) was invisible to
+        // the check and the non-persistence warning never fired.
+        let table = "overlay /mnt/data\\011sub overlay rw 0 0\n";
+        assert!(
+            path_on_overlayfs_in(Path::new("/mnt/data\tsub/db"), table),
+            "a tab in the mount point must not hide the overlay mount"
+        );
+    }
+
+    #[test]
+    fn overlayfs_detects_newline_escaped_mount_points() {
+        let table = "overlay /mnt/data\\012tail overlay rw 0 0\n";
+        assert!(
+            path_on_overlayfs_in(Path::new("/mnt/data\ntail/db"), table),
+            "a newline in the mount point must not hide the overlay mount"
+        );
+    }
+
+    #[test]
+    fn overlayfs_detects_backslash_escaped_mount_points() {
+        let table = "overlay /mnt/d\\134ata overlay rw 0 0\n";
+        assert!(
+            path_on_overlayfs_in(Path::new("/mnt/d\\ata/db"), table),
+            "a backslash in the mount point must not hide the overlay mount"
+        );
+    }
+
+    #[test]
+    fn overlayfs_survives_a_non_utf8_mount_line() {
+        // The kernel passes non-UTF-8 bytes in path fields through raw:
+        // one such line used to fail the whole `read_to_string` table read,
+        // blinding the scan for every other mount as well.
+        let mut table = b"overlay /mnt/data overlay rw 0 0\n".to_vec();
+        table.extend_from_slice(b"tmpfs /mnt/\xff\xfe tmpfs rw 0 0\n");
+        assert!(path_on_overlayfs_bytes(Path::new("/mnt/data/db"), &table));
+    }
+
+    #[test]
+    fn overlayfs_does_not_conflate_raw_bytes_with_replacement_chars() {
+        // Byte-exact matching: a mount point carrying a raw 0xff byte must
+        // not match a queried path whose lossy rendering would be U+FFFD.
+        let table = b"overlay /mnt/\xff overlay rw 0 0\n";
+        assert!(!path_on_overlayfs_bytes(
+            Path::new("/mnt\u{FFFD}/db"),
+            table
+        ));
     }
 
     #[test]
