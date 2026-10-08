@@ -506,39 +506,72 @@ fn user_event_text(event: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Strip `<system-reminder>...</system-reminder>` blocks from text.
+/// XML-style tag pairs injected into user turns by the IDEs and CLIs whose
+/// sessions this listing reads (Qoder slash-command transcripts, Claude Code
+/// local-command transcripts, system reminders, MEMORY.md injections). Their
+/// content is not genuine user text and must not surface in first-message
+/// previews, and a turn that carries nothing else is not human text at all.
 ///
-/// A reminder may open and close on the same line, and a line may carry text
-/// outside the tags; only the block itself is removed. Lines that hold
-/// nothing but reminder content are dropped whole, so a multi-line reminder
-/// leaves no blank gap behind.
-fn strip_system_context(text: &str) -> String {
-    const OPEN: &str = "<system-reminder>";
-    const CLOSE: &str = "</system-reminder>";
+/// Must stay in step with `agentsight_trajectory_collector`'s
+/// `SYSTEM_TAG_PAIRS` (the documented contract for external callers) and the
+/// agentsight-opt trace copy: a pair only one list knows about makes this
+/// listing disagree with the stored-trajectory views about which sessions
+/// carry human text, the exact divergence the collector's contract comment
+/// warns about.
+const SYSTEM_TAG_PAIRS: &[(&str, &str)] = &[
+    ("<system-reminder>", "</system-reminder>"),
+    ("<current_notes_content>", "</current_notes_content>"),
+    ("<command-message>", "</command-message>"),
+    ("<command-name>", "</command-name>"),
+    ("<command-args>", "</command-args>"),
+    ("<local-command-caveat>", "</local-command-caveat>"),
+    ("<local-command-stdout>", "</local-command-stdout>"),
+    ("<local-command-stderr>", "</local-command-stderr>"),
+];
 
+/// Strip system-injected tag blocks from text, for every pair in
+/// [`SYSTEM_TAG_PAIRS`].
+///
+/// A block may open and close on the same line, and a line may carry text
+/// outside the tags; only the block itself is removed. Lines that hold
+/// nothing but injected content are dropped whole, so a multi-line block
+/// leaves no blank gap behind. An unterminated opening tag swallows the rest
+/// of the text, matching the collector's semantics.
+fn strip_system_context(text: &str) -> String {
+    let mut current = text.to_string();
+    for &(open, close) in SYSTEM_TAG_PAIRS {
+        if current.contains(open) {
+            current = strip_tag_pair(&current, open, close);
+        }
+    }
+    current.trim().to_string()
+}
+
+/// One line-oriented pass removing every `<open>...</close>` block.
+fn strip_tag_pair(text: &str, open: &str, close: &str) -> String {
     let mut result = String::new();
-    let mut in_reminder = false;
+    let mut in_block = false;
     for line in text.lines() {
         let mut rest = line;
         let mut kept = String::new();
-        let mut saw_reminder = in_reminder;
+        let mut saw_block = in_block;
         while !rest.is_empty() {
-            if in_reminder {
-                saw_reminder = true;
-                match rest.find(CLOSE) {
+            if in_block {
+                saw_block = true;
+                match rest.find(close) {
                     Some(idx) => {
-                        in_reminder = false;
-                        rest = &rest[idx + CLOSE.len()..];
+                        in_block = false;
+                        rest = &rest[idx + close.len()..];
                     }
                     None => break,
                 }
             } else {
-                match rest.find(OPEN) {
+                match rest.find(open) {
                     Some(idx) => {
                         kept.push_str(&rest[..idx]);
-                        saw_reminder = true;
-                        in_reminder = true;
-                        rest = &rest[idx + OPEN.len()..];
+                        saw_block = true;
+                        in_block = true;
+                        rest = &rest[idx + open.len()..];
                     }
                     None => {
                         kept.push_str(rest);
@@ -547,7 +580,7 @@ fn strip_system_context(text: &str) -> String {
                 }
             }
         }
-        if saw_reminder && kept.is_empty() {
+        if saw_block && kept.is_empty() {
             continue;
         }
         if !result.is_empty() {
@@ -763,6 +796,56 @@ mod tests {
         assert!(!session.first_message.contains("system-reminder"));
         assert!(!session.first_message.contains("ignore this"));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn parse_session_file_excludes_command_only_transcripts() {
+        // A session whose only user event is a slash-command transcript
+        // (<command-message>/<command-args>) carries no human text: the
+        // collector-side strip contract removes all eight injected tag
+        // pairs, so the stored-trajectory views record no user turn for
+        // the same file. The local listing must agree instead of showing
+        // the injected command transcript as the session's first user
+        // message.
+        let tmp = std::env::temp_dir().join("agentsight_cmdonly_test.jsonl");
+        std::fs::write(
+            &tmp,
+            "{\"type\":\"user\",\"sessionId\":\"sess-cmd\",\"message\":{\"role\":\"user\",\"content\":\"<command-message>clear</command-message><command-args></command-args>\"}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Cleared.\"}]}}\n",
+        )
+        .unwrap();
+        let source = &SESSION_SOURCES[0];
+        let result = parse_session_file(&tmp, source, "test");
+        assert!(
+            result.is_none(),
+            "a command-only transcript carries no human text: {result:?}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn parse_session_file_strips_local_command_transcripts_from_previews() {
+        // Genuine text mixed with injected blocks keeps the session listed,
+        // but the preview must show only the user-authored part.
+        let tmp = std::env::temp_dir().join("agentsight_cmdmix_test.jsonl");
+        std::fs::write(
+            &tmp,
+            "{\"type\":\"user\",\"sessionId\":\"sess-mix\",\"message\":{\"role\":\"user\",\"content\":\"<command-message>compact</command-message>please summarize<local-command-stdout>done</local-command-stdout>\"}}\n",
+        )
+        .unwrap();
+        let source = &SESSION_SOURCES[0];
+        let result = parse_session_file(&tmp, source, "test");
+        let session = result.expect("genuine text keeps the session listed");
+        assert_eq!(session.first_message, "please summarize");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_strip_system_context_current_notes_content() {
+        // The MEMORY.md injection pair is part of the collector-side strip
+        // contract; a text block that is entirely injected content must
+        // strip to empty here exactly as it does there.
+        let text = "<current_notes_content>MEMORY.md dump\nline two</current_notes_content>";
+        assert_eq!(strip_system_context(text), "");
     }
 
     #[test]
