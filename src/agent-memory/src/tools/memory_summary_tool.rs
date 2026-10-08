@@ -198,14 +198,16 @@ pub fn memory_summary(svc: &MemoryService, recent_limit: usize) -> Result<Memory
         .map(|(_, entry)| entry)
         .collect();
 
-    // Top concepts (sorted by count descending)
+    // Top concepts (sorted by count descending, ties by name so the ranking
+    // and the take() boundary are a function of the memory set, not of
+    // HashMap iteration order — which is randomized per process)
     let mut concepts: Vec<(String, usize)> = concept_counts.into_iter().collect();
-    concepts.sort_by_key(|b| std::cmp::Reverse(b.1));
+    concepts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     summary.top_concepts = concepts.into_iter().take(10).collect();
 
-    // Top files (sorted by count descending)
+    // Top files (same count-descending, name-tiebreak order)
     let mut files: Vec<(String, usize)> = file_counts.into_iter().collect();
-    files.sort_by_key(|b| std::cmp::Reverse(b.1));
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     summary.top_files = files.into_iter().take(10).collect();
 
     svc.audit_log(
