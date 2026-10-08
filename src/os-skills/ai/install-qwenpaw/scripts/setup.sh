@@ -37,6 +37,24 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 QWENPAW_DIR="$HOME/.qwenpaw"
 SECRET_DIR="$HOME/.qwenpaw.secret"
 
+# Escape a value for the JSON templates: '\' and '"' are not valid inside
+# a JSON string unescaped.
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# Escape a value for use in a sed replacement: '&' re-inserts the matched
+# placeholder, '\' becomes a backreference/error, and '|' would terminate
+# the s command — credentials with any of these were silently corrupted.
+sed_escape() {
+  printf '%s' "$1" | sed -e 's/[\\|&]/\\&/g'
+}
+
+# Render one value safe for both layers: JSON first, then the sed command.
+render_value() {
+  sed_escape "$(json_escape "$1")"
+}
+
 echo "=============================="
 echo " QwenPaw 安装部署"
 echo "=============================="
@@ -100,8 +118,8 @@ if [ ! -f "$CONFIG_TEMPLATE" ]; then
   exit 1
 fi
 sed \
-  -e "s|{DINGTALK_CLIENT_ID}|${DINGTALK_CLIENT_ID}|g" \
-  -e "s|{DINGTALK_CLIENT_SECRET}|${DINGTALK_CLIENT_SECRET}|g" \
+  -e "s|{DINGTALK_CLIENT_ID}|$(render_value "$DINGTALK_CLIENT_ID")|g" \
+  -e "s|{DINGTALK_CLIENT_SECRET}|$(render_value "$DINGTALK_CLIENT_SECRET")|g" \
   "$CONFIG_TEMPLATE" > "$QWENPAW_DIR/config.json"
 echo "  config.json 已写入"
 
@@ -111,7 +129,7 @@ if [ ! -f "$DASHSCOPE_TEMPLATE" ]; then
   echo "  错误: 找不到模板文件 $DASHSCOPE_TEMPLATE"
   exit 1
 fi
-sed "s|{DASHSCOPE_API_KEY}|${DASHSCOPE_API_KEY}|g" \
+sed "s|{DASHSCOPE_API_KEY}|$(render_value "$DASHSCOPE_API_KEY")|g" \
   "$DASHSCOPE_TEMPLATE" > "$SECRET_DIR/providers/builtin/dashscope.json"
 chmod 600 "$SECRET_DIR/providers/builtin/dashscope.json"
 echo "  dashscope.json 已写入"
@@ -122,7 +140,7 @@ if [ ! -f "$ACTIVE_MODEL_TEMPLATE" ]; then
   echo "  错误: 找不到模板文件 $ACTIVE_MODEL_TEMPLATE"
   exit 1
 fi
-sed "s|{MODEL_NAME}|${MODEL_NAME}|g" \
+sed "s|{MODEL_NAME}|$(render_value "$MODEL_NAME")|g" \
   "$ACTIVE_MODEL_TEMPLATE" > "$SECRET_DIR/providers/active_model.json"
 chmod 600 "$SECRET_DIR/providers/active_model.json"
 echo "  active_model.json 已写入"
