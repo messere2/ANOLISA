@@ -248,3 +248,36 @@ fn cancellation_during_final_host_call_cannot_return_proceed() {
         .get("candidate")
         .is_some());
 }
+
+#[test]
+fn command_gate_deny_overlapping_cancellation_stays_a_denial() {
+    // Cancellation observed after a Host call must not erase the verdict the
+    // command gate already returned: the recorded terminal decision keeps the
+    // observed denial, while the step entry still explains the cancellation.
+    let core = Core::new().unwrap();
+    let mut host = Host::new();
+    let flag = Rc::new(Cell::new(false));
+    host.replies = vec![Reply::Deny];
+    host.cancel_after_call = Some(flag.clone());
+    let prepared = core.prepare(request(true), &host, 1000).unwrap();
+    let result = core
+        .execute(
+            prepared,
+            &mut host,
+            &mut MemoryJournal::default(),
+            &FixedClock(1100),
+            &CancelFlag(flag),
+        )
+        .unwrap();
+    assert_eq!(
+        result.calls()[0].result().output.as_ref().unwrap()["decision"]["verdict"],
+        "deny"
+    );
+    assert_eq!(result.record()["steps"][0]["outcome"], "cancelled");
+    assert_eq!(
+        result.record()["steps"][0]["reason"],
+        "cancellation_requested"
+    );
+    assert_eq!(result.record()["decision"], "deny");
+    assert_eq!(result.record()["steps"][1]["outcome"], "skipped");
+}

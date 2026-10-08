@@ -181,7 +181,10 @@ impl Core {
             });
             if cancelled {
                 entry["reason"] = json!("cancellation_requested");
-                decision = "cancelled";
+                // A command-gate verdict already observed in this step is
+                // terminal evidence: overlapping cancellation must not
+                // launder an observed denial into a mere cancellation.
+                decision = if rejected { "deny" } else { "cancelled" };
             } else {
                 if gap {
                     entry["reason"] = json!("provider_result_unavailable");

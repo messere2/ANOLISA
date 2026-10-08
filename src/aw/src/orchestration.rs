@@ -295,7 +295,10 @@ impl Registry {
                 }
             }
             if entry["outcome"] == "cancelled" {
-                decision = "cancelled";
+                // Mirror the executor: a command-gate verdict inside a
+                // cancelled step stays a denial, so a record that relabels
+                // an observed denial as a cancellation is rejected here.
+                decision = if rejected { "deny" } else { "cancelled" };
                 continue;
             }
             let selected = array(&step["providers"])?;
