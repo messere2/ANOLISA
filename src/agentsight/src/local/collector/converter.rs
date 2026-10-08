@@ -12,7 +12,7 @@
 
 use agentsight_atif::{
     ATIF_SCHEMA_VERSION, Agent, AtifTrajectory, EXTRA_IS_ERROR, FinalMetrics, Observation,
-    ObservationResult, Step, StepSource, ToolCall,
+    ObservationResult, Step, StepSource, ToolCall, same_call_id,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -335,20 +335,18 @@ fn flatten_tool_result_content(content: &Value) -> String {
     }
 }
 
+/// Attach tool results to the agent step that issued the matching call.
+///
+/// Mirrors the collector crate's `merge_tool_results_into_agent_steps`: a
+/// result answers the call of one specific step, so it is merged into the
+/// most recent agent step whose `tool_calls` contain the result's
+/// `tool_use_id` (fuzzy id matching, as in the collector). Attaching every
+/// result to the newest agent step misattributes late results — once a newer
+/// agent turn exists, the output lands on a step that never issued the call
+/// and the issuing step loses its observation. A result whose call no step
+/// owns (a session continued from another file) has no truthful attachment
+/// point and is dropped, exactly as in the collector.
 fn append_tool_results(steps: &mut [Step], blocks: &[Value]) {
-    let last_agent_step = steps
-        .iter_mut()
-        .rev()
-        .find(|s| s.source == StepSource::Agent);
-    let step = match last_agent_step {
-        Some(s) => s,
-        None => return,
-    };
-
-    let observation = step.observation.get_or_insert(Observation {
-        results: Vec::new(),
-    });
-
     for block in blocks {
         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
         if block_type != "tool_result" {
@@ -358,6 +356,27 @@ fn append_tool_results(steps: &mut [Step], blocks: &[Value]) {
             .get("tool_use_id")
             .and_then(|v| v.as_str())
             .map(String::from);
+        // Most recent owner wins: each call is issued by exactly one step,
+        // and searching backwards also covers results arriving after an
+        // intervening user or agent turn. A missing id matches nothing, as
+        // in the collector's `unwrap_or("")` extraction.
+        let Some(step) = steps.iter_mut().rev().find(|s| {
+            s.source == StepSource::Agent
+                && s.tool_calls.as_ref().is_some_and(|tcs| {
+                    tcs.iter().any(|tc| {
+                        same_call_id(&tc.tool_call_id, source_call_id.as_deref().unwrap_or(""))
+                    })
+                })
+        }) else {
+            // No step owns the call, so there is no truthful step to attach
+            // the result to.
+            continue;
+        };
+
+        let observation = step.observation.get_or_insert(Observation {
+            results: Vec::new(),
+        });
+
         let content = Some(Value::String(
             block
                 .get("content")
@@ -490,6 +509,86 @@ mod tests {
         let content = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tc1","content":"result"}]}}"#;
         let traj = convert_jsonl_content_to_atif(content).unwrap();
         assert_eq!(traj.steps.len(), 0);
+    }
+
+    #[test]
+    fn test_late_tool_result_attaches_to_the_issuing_agent_step() {
+        // A result that arrives after a newer agent turn must still land on
+        // the step that issued the call. Attaching it to the newest agent
+        // step would give that step an observation for a call it never made
+        // and hide the output from the step that did.
+        let content = r#"{"type":"assistant","message":{"model":"m","content":[{"type":"tool_use","id":"t1","name":"bash","input":{}},{"type":"tool_use","id":"t2","name":"read","input":{}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"a.txt"},{"type":"text","text":"also update the docs"}]}}
+{"type":"assistant","message":{"model":"m","content":[{"type":"text","text":"meanwhile, drafting the summary"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"b.txt"}]}}"#;
+        let traj = convert_jsonl_content_to_atif(content).unwrap();
+        // issuing agent step, the user text step, the intervening agent step
+        assert_eq!(traj.steps.len(), 3, "steps: {:#?}", traj.steps);
+        let issuer = &traj.steps[0];
+        assert_eq!(issuer.source, StepSource::Agent);
+        let obs = issuer
+            .observation
+            .as_ref()
+            .expect("the issuing step keeps both results");
+        let ids: Vec<&str> = obs
+            .results
+            .iter()
+            .filter_map(|r| r.source_call_id.as_deref())
+            .collect();
+        assert!(ids.contains(&"t1") && ids.contains(&"t2"), "ids: {:?}", ids);
+        let late = &traj.steps[2];
+        assert_eq!(late.source, StepSource::Agent);
+        assert!(
+            late.observation.is_none(),
+            "a step that issued no calls must not adopt a late result"
+        );
+    }
+
+    #[test]
+    fn test_results_after_mixed_event_merge_into_agent_step() {
+        // Mirror of the collector crate's regression test: the mixed
+        // tool_result+text event and the following result-only event must
+        // both merge into the issuing step's observation, and observations
+        // never land on user steps.
+        let content = r#"{"type":"assistant","message":{"model":"m","content":[{"type":"tool_use","id":"t1","name":"bash","input":{}},{"type":"tool_use","id":"t2","name":"read","input":{}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"a.txt"},{"type":"text","text":"also update the docs"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"b.txt"}]}}"#;
+        let traj = convert_jsonl_content_to_atif(content).unwrap();
+        // agent step + the user step yielded by the mixed event
+        assert_eq!(traj.steps.len(), 2, "steps: {:#?}", traj.steps);
+        let agent = &traj.steps[0];
+        assert_eq!(agent.source, StepSource::Agent);
+        let obs = agent
+            .observation
+            .as_ref()
+            .expect("the issuing step keeps both results");
+        let ids: Vec<&str> = obs
+            .results
+            .iter()
+            .filter_map(|r| r.source_call_id.as_deref())
+            .collect();
+        assert!(ids.contains(&"t1") && ids.contains(&"t2"), "ids: {:?}", ids);
+        assert!(
+            traj.steps[1].observation.is_none(),
+            "observations never land on user steps"
+        );
+    }
+
+    #[test]
+    fn test_unowned_tool_result_is_dropped() {
+        // A session continued from another file starts with results for
+        // calls the earlier file issued. No step here owns the call, and
+        // attaching the result to the newest agent step would fake a call
+        // that step never made; the collector drops unowned results for
+        // the same reason.
+        let content = r#"{"type":"assistant","message":{"model":"m","content":[{"type":"text","text":"hello"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"from-previous-file","content":"stale output"}]}}"#;
+        let traj = convert_jsonl_content_to_atif(content).unwrap();
+        assert_eq!(traj.steps.len(), 1, "steps: {:#?}", traj.steps);
+        assert!(
+            traj.steps[0].observation.is_none(),
+            "unowned results must not be attached to a step that never issued them"
+        );
     }
 
     #[test]
