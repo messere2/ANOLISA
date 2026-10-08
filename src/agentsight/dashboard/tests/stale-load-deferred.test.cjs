@@ -775,6 +775,8 @@ function renderCausalPanel() {
   const driver = createHooksDriver();
   const moduleStubs = {
     '../utils/apiClient': { ...stubs },
+    // The panel clips its tags through the shared, code-point-safe helper.
+    '../utils/truncate': loadPageModule('src/utils/truncate.ts', {}, driver),
   };
   const module = loadPageModule('src/components/CausalAttributionPanel.tsx', moduleStubs, driver);
   const panel = module.CausalAttributionPanel;
@@ -1067,6 +1069,14 @@ function renderAtifPage() {
     '../utils/roundModel': roundModel,
     '../utils/savings': (() => {
       const out = transpile('src/utils/savings.ts');
+      const mod = { exports: {} };
+      new Function('require', 'module', 'exports', out)(() => ({}), mod, mod.exports);
+      return mod.exports;
+    })(),
+    // Transport note (MA5p rebase): the page now clips its text through the
+    // shared, code-point-safe helper; it has no runtime imports of its own.
+    '../utils/truncate': (() => {
+      const out = transpile('src/utils/truncate.ts');
       const mod = { exports: {} };
       new Function('require', 'module', 'exports', out)(() => ({}), mod, mod.exports);
       return mod.exports;

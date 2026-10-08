@@ -62,6 +62,7 @@ function viewer({ readFailure = false } = {}) {
       if (name === '../utils/trajectoryTree') return require(process.env.AGENTSIGHT_TRAJECTORY_TREE_BUILD);
       if (name === '../utils/trajectoryTextFilter') return require(process.env.AGENTSIGHT_TRAJECTORY_FILTER_BUILD);
       if (name === '../utils/roundModel') return require(process.env.AGENTSIGHT_ROUND_MODEL_BUILD);
+      if (name === '../utils/truncate') return require(process.env.AGENTSIGHT_TRUNCATE_BUILD);
       if (name.startsWith('../components/')) return {};
       throw new Error(`Unexpected ATIF viewer dependency ${name}`);
     },

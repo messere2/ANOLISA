@@ -44,6 +44,7 @@ try {
       'src/utils/trajectoryTree.ts',
       'src/utils/trajectoryTextFilter.ts',
       'src/utils/roundModel.ts',
+      'src/utils/truncate.ts',
       'tests/apiClient-globals.d.ts',
     ],
     { stdio: 'inherit' },
@@ -69,6 +70,7 @@ try {
       AGENTSIGHT_TRAJECTORY_TREE_BUILD: join(outputDir, 'utils', 'trajectoryTree.js'),
       AGENTSIGHT_TRAJECTORY_FILTER_BUILD: join(outputDir, 'utils', 'trajectoryTextFilter.js'),
       AGENTSIGHT_ROUND_MODEL_BUILD: join(outputDir, 'utils', 'roundModel.js'),
+      AGENTSIGHT_TRUNCATE_BUILD: join(outputDir, 'utils', 'truncate.js'),
     },
     stdio: 'inherit',
   });

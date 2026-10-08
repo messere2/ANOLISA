@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { runCausalAttribution } from '../utils/apiClient';
+import { truncateText } from '../utils/truncate';
 import type {
   CausalAttrib,
   CausalFinding,
@@ -239,7 +240,7 @@ function NodeRect({
   // Truncate the evaluator's summary so it fits within the node width. The
   // full text is shown in the detail panel below the graph.
   const shortTag = (node.tag || '').length > 14
-    ? `${(node.tag || '').slice(0, 13)}…`
+    ? truncateText(node.tag || '', 13)
     : (node.tag || '');
 
   return (
@@ -379,7 +380,7 @@ function CausalGraph({
               </div>
             ) : (
               <p className="text-sm text-gray-600 italic mb-2">
-                {(selected.plain || '').slice(0, 200)}
+                {truncateText(selected.plain || '', 200)}
               </p>
             )}
 
