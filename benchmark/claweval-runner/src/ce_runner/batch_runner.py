@@ -55,6 +55,28 @@ def pass_at_k(n: int, c: int, k: int) -> float:
     return 1.0 - math.comb(n - c, k) / math.comb(n, k)
 
 
+def aggregate_task_results(batch_results):
+    """Group flat per-trial entries into per-task records, ordered by trial.
+
+    ``batch_results`` is appended in grading *completion* order, which under
+    ``--grade-parallel`` differs from trial-number order. Downstream reports
+    (``scripts/summarize_results.py`` build_table, ``scripts/analyze.py``
+    build_summary_table) label the per-trial rows positionally with
+    ``enumerate(..., 1)``, so each task's ``trials`` list must be sorted by
+    its trial number or the report rows show the wrong score under each
+    ``#n`` label.
+    """
+    task_results = {}
+    for entry in batch_results:
+        tid = entry["task_id"]
+        if tid not in task_results:
+            task_results[tid] = {"task_id": tid, "trials": []}
+        task_results[tid]["trials"].append(entry["trial"])
+    for tr in task_results.values():
+        tr["trials"].sort(key=lambda trial: trial["trial"])
+    return task_results
+
+
 def run_batch(args, get_judge_config, get_model_config, get_user_agent_config,
               discover_tasks):
     """Execute batch of tasks with chunked parallel agent execution.
@@ -734,12 +756,7 @@ def run_batch(args, get_judge_config, get_model_config, get_user_agent_config,
     grade_pool.shutdown(wait=True)
 
     # ── Aggregate results per task ───────────────────────────────────────
-    task_results = {}
-    for entry in batch_results:
-        tid = entry["task_id"]
-        if tid not in task_results:
-            task_results[tid] = {"task_id": tid, "trials": []}
-        task_results[tid]["trials"].append(entry["trial"])
+    task_results = aggregate_task_results(batch_results)
 
     total_wall_time = 0.0
     n_pass_at_1 = 0

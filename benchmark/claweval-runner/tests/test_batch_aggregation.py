@@ -54,3 +54,97 @@ class TestPassAtK:
         from ce_runner.batch_runner import pass_at_k
         # n=5, c=4, k=2 -> n-c=1 < k -> returns 1.0
         assert pass_at_k(5, 4, 2) == 1.0
+
+
+class TestAggregateTaskResults:
+    """Per-task trial lists must be ordered by trial number.
+
+    Under --grade-parallel the flat batch_results list is appended in
+    grading completion order, but the report renderers label each task's
+    trial rows positionally (#1, #2, ...), so the aggregated trials must
+    come back sorted by their trial number.
+    """
+
+    @staticmethod
+    def _entry(tid, number, score):
+        """One flat batch_results entry shaped like _collect_completed's."""
+        return {
+            "task_id": tid,
+            "trial": {
+                "trial": number,
+                "task_score": score,
+                "passed": score >= 0.75,
+                "completion": score,
+                "robustness": score,
+                "communication": score,
+                "safety": score,
+                "error": None,
+                "wall_time_s": 1.0,
+                "session_id": "s1",
+                "trace_file": None,
+                "session_archive_file": None,
+                "session_origin_file": None,
+            },
+        }
+
+    def test_trials_sorted_by_trial_number(self):
+        """Completion order [2, 1] must aggregate to trial order [1, 2]."""
+        from ce_runner.batch_runner import aggregate_task_results
+        batch = [self._entry("T001", 2, 0.9), self._entry("T001", 1, 0.2)]
+        tr = aggregate_task_results(batch)["T001"]
+        assert [t["trial"] for t in tr["trials"]] == [1, 2]
+
+    def test_three_trials_reverse_completion(self):
+        """Completion order [3, 2, 1] must aggregate to [1, 2, 3]."""
+        from ce_runner.batch_runner import aggregate_task_results
+        batch = [
+            self._entry("T001", 3, 0.5),
+            self._entry("T001", 2, 0.9),
+            self._entry("T001", 1, 0.2),
+        ]
+        tr = aggregate_task_results(batch)["T001"]
+        assert [t["trial"] for t in tr["trials"]] == [1, 2, 3]
+
+    def test_tasks_grouped_separately(self):
+        """Interleaved tasks keep their own sorted trial lists."""
+        from ce_runner.batch_runner import aggregate_task_results
+        batch = [
+            self._entry("T002", 2, 0.9),
+            self._entry("T001", 1, 0.2),
+            self._entry("T002", 1, 0.5),
+            self._entry("T001", 2, 0.8),
+        ]
+        out = aggregate_task_results(batch)
+        assert sorted(out.keys()) == ["T001", "T002"]
+        assert [t["trial"] for t in out["T001"]["trials"]] == [1, 2]
+        assert [t["trial"] for t in out["T002"]["trials"]] == [1, 2]
+
+    def test_single_trial_unchanged(self):
+        """A single trial keeps its record and task_id."""
+        from ce_runner.batch_runner import aggregate_task_results
+        batch = [self._entry("T001", 1, 0.2)]
+        out = aggregate_task_results(batch)
+        assert out["T001"]["task_id"] == "T001"
+        assert [t["trial"] for t in out["T001"]["trials"]] == [1]
+
+    def test_report_labels_match_trial_numbers(self):
+        """User-visible contract: fed to summarize_results.build_table, the
+        positional #n label must carry trial n's score regardless of the
+        completion order recorded in batch_results."""
+        import importlib.util
+        from pathlib import Path
+
+        from ce_runner.batch_runner import aggregate_task_results
+
+        script = Path(__file__).resolve().parents[1] / "scripts" / "summarize_results.py"
+        spec = importlib.util.spec_from_file_location("summarize_results_uut", script)
+        summary = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(summary)
+
+        batch = [self._entry("T001", 2, 0.9), self._entry("T001", 1, 0.2)]
+        data = [dict(aggregate_task_results(batch)["T001"],
+                     task_name="demo", difficulty="easy")]
+        rows = summary.build_table(data)[1:]
+        by_label = {row[3]: row[15] for row in rows}
+        assert by_label["#1"] == "0.20", by_label
+        assert by_label["#2"] == "0.90", by_label
