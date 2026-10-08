@@ -133,6 +133,39 @@ fn normalize_results(mut items: Vec<SemanticSearchResult>) -> Vec<SemanticSearch
     items
 }
 
+/// Anchor the ranking verdict back to the request's candidate set.
+///
+/// The ranked list is LLM output, and the model can echo an id that was never
+/// a candidate (hallucination) or list one id twice. The endpoint's contract
+/// is that results reference the sessions the request listed, so unknown ids
+/// are dropped and repeats collapse to their first occurrence — the model's
+/// own priority, the same order-preservation `normalize_results` applies
+/// inside a bucket. This is the drop-unmatched discipline the accuracy
+/// detectors already apply to LLM-returned call ids, applied to the one
+/// LLM-judged list that still reached callers unfiltered (the dashboard
+/// happens to mask both problems client-side, the way it once masked the
+/// unordered buckets).
+fn anchor_results(
+    mut items: Vec<SemanticSearchResult>,
+    candidates: &[SemanticSearchCandidate],
+) -> Vec<SemanticSearchResult> {
+    let known: std::collections::HashSet<&str> =
+        candidates.iter().map(|c| c.session_id.as_str()).collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let before = items.len();
+    items.retain(|item| {
+        known.contains(item.session_id.as_str()) && seen.insert(item.session_id.clone())
+    });
+    let dropped = before - items.len();
+    if dropped > 0 {
+        log::warn!(
+            "semantic_search: dropped {dropped} ranked result(s) that were not requested \
+             candidates or repeated a session id"
+        );
+    }
+    items
+}
+
 /// Ask the configured LLM to rank `candidates` by semantic relevance to `query`.
 ///
 /// Returns the normalized, relevance-ordered results, or an empty vector on
@@ -158,7 +191,7 @@ pub async fn rank_sessions(
     .await;
 
     match parsed {
-        Ok(Ok(items)) => normalize_results(items),
+        Ok(Ok(items)) => normalize_results(anchor_results(items, candidates)),
         Ok(Err(error)) => {
             log::warn!("semantic_search: LLM ranking failed, returning empty results: {error}");
             vec![]
@@ -486,6 +519,85 @@ mod tests {
             }
         });
         format!("http://{addr}/v1")
+    }
+
+    /// A mock OpenAI-compatible endpoint that answers every ranking call with
+    /// one canned completion body, so the post-verdict handling of a *parsed*
+    /// ranking can be exercised end to end without a real LLM.
+    fn responding_llm(body: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock llm");
+        let addr = listener.local_addr().expect("mock llm addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                // Drain the request head so the client is not reset mid-send.
+                let _ = std::io::Read::read(&mut stream, &mut [0u8; 8192]);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    /// A canned completion whose content ranks `ghost-1` (an id never sent in
+    /// the candidate list), `s1` twice (medium then high), and `s2` once.
+    fn ghost_and_duplicate_completion() -> String {
+        let content = r#"[
+            {"session_id":"ghost-1","relevance":"high","reason":"hallucinated"},
+            {"session_id":"s1","relevance":"medium","reason":"first verdict"},
+            {"session_id":"s1","relevance":"high","reason":"duplicate verdict"},
+            {"session_id":"s2","relevance":"high","reason":"legitimate"}
+        ]"#;
+        serde_json::json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+        .to_string()
+    }
+
+    /// The ranking verdict is LLM output, and the endpoint's contract is that
+    /// results reference the sessions the request listed. An id the model
+    /// hallucinated (never a candidate) or echoed twice used to reach the
+    /// caller as-is — the dashboard happens to drop unknown ids and collapse
+    /// duplicates client-side, but every other consumer of
+    /// `POST /api/sessions/search` does not, the same masking that once hid
+    /// the unordered relevance buckets (fixed server-side by normalize_results).
+    #[test]
+    fn ranked_results_are_anchored_to_the_requested_candidates() {
+        let base = responding_llm(ghost_and_duplicate_completion());
+        let client = LlmClient::with_config(base, "test-key", "test-model");
+        let candidates = vec![candidate("s1"), candidate("s2")];
+
+        let results = actix_web::rt::System::new().block_on(rank_sessions(
+            &client,
+            "q",
+            &candidates,
+            std::time::Duration::from_secs(30),
+        ));
+
+        let ids: Vec<&str> = results.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["s2", "s1"],
+            "unknown ids must be dropped and repeats collapse to their first occurrence, \
+             keeping the model's order inside a bucket"
+        );
+        assert_eq!(
+            results[1].relevance, "medium",
+            "the surviving duplicate is the model's first (highest-priority) verdict"
+        );
     }
 
     #[test]
