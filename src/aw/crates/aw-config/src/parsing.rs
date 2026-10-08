@@ -3,6 +3,7 @@
 use crate::{Error, MAX_DEPTH, MAX_DOCUMENT_BYTES};
 use serde::de::{self, DeserializeSeed, Deserializer, EnumAccess, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
+use std::cell::Cell;
 use std::fmt;
 
 #[derive(Default)]
@@ -174,5 +175,142 @@ pub(super) fn parse(input: &[u8]) -> Result<Value, Error> {
     if encoded.len() > MAX_DOCUMENT_BYTES {
         return Err(invalid("expanded document exceeds size limit"));
     }
+    if contains_float(&value) {
+        audit_float_sources(input, &value)?;
+    }
     Ok(value)
+}
+
+/// Whether any number in the document is only representable as an `f64`.
+fn contains_float(value: &Value) -> bool {
+    match value {
+        Value::Number(number) => number.is_f64(),
+        Value::Array(values) => values.iter().any(contains_float),
+        Value::Object(values) => values.values().any(contains_float),
+        _ => false,
+    }
+}
+
+/// Reason shared with `aw-provider`'s JSON integer-range rule.
+const INTEGER_RANGE: &str = "integer is outside the supported range";
+
+/// Rejects plain decimal integer literals that the YAML layer rounded to `f64`.
+///
+/// A plain integer wider than the `i128` and `u128` ranges falls through to
+/// `serde_yaml_ng`'s float fallback, and by the time `visit_f64` runs the
+/// scalar text is gone, so a rounded literal is indistinguishable from `1e40`
+/// by value alone. This second pass re-reads the same events, follows the
+/// structure the first pass accepted and recovers the source text of exactly
+/// the scalars that became floats. Anchors and aliases resolve to the scalar
+/// they name; comments never produce events, and quoted or block scalars
+/// became strings, so none of them can trip the audit. A scalar tagged
+/// `!!float` keeps accepting literals whose digits still fit the 128-bit
+/// ranges, so only genuinely unrepresentable integers are rejected.
+fn audit_float_sources(input: &str, value: &Value) -> Result<(), Error> {
+    let invalid = |reason| Error::Document {
+        reason,
+        line: None,
+        column: None,
+    };
+    let document = serde_yaml_ng::Deserializer::from_str(input)
+        .next()
+        .ok_or_else(|| invalid("expected one document"))?;
+    let reason = Cell::new(None);
+    Sources {
+        shape: value,
+        reason: &reason,
+    }
+    .deserialize(document)
+    .map_err(|error| Error::Document {
+        reason: reason.get().unwrap_or("invalid YAML syntax or scalar"),
+        line: error.location().map(|location| location.line()),
+        column: error.location().map(|location| location.column()),
+    })
+}
+
+/// Second-pass seed for [`audit_float_sources`]: re-reads one document the
+/// first pass already accepted and audits the text behind every float.
+#[derive(Clone, Copy)]
+struct Sources<'a> {
+    shape: &'a Value,
+    reason: &'a Cell<Option<&'static str>>,
+}
+
+impl<'de> DeserializeSeed<'de> for Sources<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        match self.shape {
+            Value::Object(_) => deserializer.deserialize_map(self),
+            Value::Array(_) => deserializer.deserialize_seq(self),
+            Value::Number(number) if number.is_f64() => deserializer.deserialize_str(self),
+            _ => deserializer
+                .deserialize_ignored_any(de::IgnoredAny)
+                .map(drop),
+        }
+    }
+}
+
+impl<'de> Visitor<'de> for Sources<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("the document accepted by the first pass")
+    }
+
+    fn visit_str<E: de::Error>(self, literal: &str) -> Result<(), E> {
+        if rounded_integer_literal(literal) {
+            self.reason.set(Some(INTEGER_RANGE));
+            Err(E::custom(INTEGER_RANGE))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let Value::Array(values) = self.shape else {
+            return Err(de::Error::custom("structure changed between passes"));
+        };
+        for shape in values {
+            if seq
+                .next_element_seed(Sources {
+                    shape,
+                    reason: self.reason,
+                })?
+                .is_none()
+            {
+                return Err(de::Error::custom("structure changed between passes"));
+            }
+        }
+        if seq.next_element::<de::IgnoredAny>()?.is_some() {
+            return Err(de::Error::custom("structure changed between passes"));
+        }
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let Value::Object(values) = self.shape else {
+            return Err(de::Error::custom("structure changed between passes"));
+        };
+        while let Some(key) = map.next_key::<String>()? {
+            let shape = values
+                .get(&key)
+                .ok_or_else(|| de::Error::custom("structure changed between passes"))?;
+            map.next_value_seed(Sources {
+                shape,
+                reason: self.reason,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether the source text of a parsed float is a signed decimal integer that
+/// no 128-bit range holds, which is how the YAML layer came to round it.
+fn rounded_integer_literal(literal: &str) -> bool {
+    let digits = literal.strip_prefix(['-', '+']).unwrap_or(literal);
+    !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && literal.parse::<i128>().is_err()
+        && literal.parse::<u128>().is_err()
 }

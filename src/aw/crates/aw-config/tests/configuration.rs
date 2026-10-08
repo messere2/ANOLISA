@@ -390,3 +390,126 @@ fn native_qoder_scheduling_is_an_explicit_adapter_setting() {
     value["spec"]["agents"]["qoder"]["qoder"]["unknown"] = json!(true);
     assert!(parse(&value).is_err());
 }
+
+#[test]
+fn unrepresentable_integer_literals_cannot_become_rounded_floats() {
+    for literal in [
+        "340282366920938463463374607431768211456",
+        "10000000000000000000000000000000000000000",
+        "-170141183460469231731687303715884105729",
+        "+10000000000000000000000000000000000000000",
+    ] {
+        let input = EXAMPLE.replace("project: platform", &format!("project: {literal}"));
+        let error = VALIDATOR.parse(input.as_bytes()).err().unwrap();
+        assert!(
+            matches!(
+                &error,
+                Error::Document {
+                    reason: "integer is outside the supported range",
+                    line: Some(_),
+                    column: Some(_),
+                }
+            ),
+            "{literal}: {error}"
+        );
+    }
+    // The audit is part of parsing, so it fires before shape validation even
+    // for documents whose remaining structure is nowhere near the schema.
+    assert!(matches!(
+        VALIDATOR.parse(b"10000000000000000000000000000000000000000"),
+        Err(Error::Document { .. })
+    ));
+    assert!(matches!(
+        VALIDATOR.parse(b"{\"n\": 10000000000000000000000000000000000000000}"),
+        Err(Error::Document { .. })
+    ));
+}
+
+#[test]
+fn anchored_and_aliased_integer_literals_are_still_rejected() {
+    let input = EXAMPLE
+        .replace(
+            "rule_sets: [command-safety, sensitive-output]",
+            "rule_sets: [command-safety, &id 10000000000000000000000000000000000000000]",
+        )
+        .replace("project: platform", "project: *id");
+    assert!(matches!(
+        VALIDATOR.parse(input.as_bytes()),
+        Err(Error::Document { .. })
+    ));
+}
+
+#[test]
+fn digits_outside_plain_scalars_do_not_reject_the_document() {
+    let input = EXAMPLE
+        .replace(
+            "  # First release: QwenPaw, Qoder CLI, OpenClaw, and Hermes.",
+            concat!(
+                "  # First release: QwenPaw, Qoder CLI, OpenClaw, and Hermes.\n",
+                "  # wide: 340282366920938463463374607431768211456 stays a comment",
+            ),
+        )
+        .replace(
+            "project: platform",
+            concat!(
+                "project: platform\n",
+                "        single: '340282366920938463463374607431768211456'\n",
+                "        double: \"170141183460469231731687303715884105729\"\n",
+                "        literal: |\n",
+                "          10000000000000000000000000000000000000000\n",
+                "        folded: >-\n",
+                "          340282366920938463463374607431768211455\n",
+                "        apostrophe: can't hide 18446744073709551616\n",
+                "        exponent: 1e40",
+            ),
+        );
+    let configuration = VALIDATOR.parse(input.as_bytes()).unwrap();
+    let config = &configuration.as_value()["spec"]["providers"]["business"]["config"];
+    assert_eq!(
+        config["single"],
+        json!("340282366920938463463374607431768211456")
+    );
+    assert_eq!(
+        config["double"],
+        json!("170141183460469231731687303715884105729")
+    );
+    assert_eq!(
+        config["literal"],
+        json!("10000000000000000000000000000000000000000\n")
+    );
+    assert_eq!(
+        config["folded"],
+        json!("340282366920938463463374607431768211455")
+    );
+    assert_eq!(
+        config["apostrophe"],
+        json!("can't hide 18446744073709551616")
+    );
+    assert_eq!(config["exponent"], json!(1e40));
+}
+
+#[test]
+fn exact_numbers_and_explicitly_typed_floats_still_parse() {
+    let input = EXAMPLE.replace(
+        "project: platform",
+        concat!(
+            "project: platform\n",
+            "        u64max: 18446744073709551615\n",
+            "        i64min: -9223372036854775808\n",
+            "        far: 1e300\n",
+            "        maximal: 1.7976931348623157e308\n",
+            "        whole: 1.5e30\n",
+            "        tagged exact: !!float 5\n",
+            "        tagged wide: !!float 18446744073709551616",
+        ),
+    );
+    let configuration = VALIDATOR.parse(input.as_bytes()).unwrap();
+    let config = &configuration.as_value()["spec"]["providers"]["business"]["config"];
+    assert_eq!(config["u64max"], json!(18446744073709551615u64));
+    assert_eq!(config["i64min"], json!(-9223372036854775808i64));
+    assert_eq!(config["far"], json!(1e300));
+    assert_eq!(config["maximal"], json!(1.7976931348623157e308));
+    assert_eq!(config["whole"], json!(1.5e30));
+    assert_eq!(config["tagged exact"].as_f64(), Some(5.0));
+    assert_eq!(config["tagged wide"].as_f64(), Some(18446744073709551616.0));
+}
