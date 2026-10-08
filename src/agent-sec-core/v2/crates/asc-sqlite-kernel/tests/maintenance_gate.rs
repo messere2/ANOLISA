@@ -1,0 +1,156 @@
+//! The maintenance gate must not advance over a failed pass.
+//!
+//! A pass whose prune fails must leave the daily marker untouched, so the
+//! next maintenance opportunity retries instead of waiting a full window.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use asc_sqlite_kernel::maintenance::maintenance_marker_path;
+use asc_sqlite_kernel::{
+    ColumnSpec, Fault, FaultPolicy, KernelError, MaintenanceOutcome, Outcome, RecordRepository,
+    SqliteSink, SqliteStore, TableSpec,
+};
+use rusqlite::Connection;
+use tempfile::TempDir;
+
+const WIDGETS: &[TableSpec] = &[TableSpec {
+    name: "widgets",
+    columns: &[ColumnSpec {
+        name: "id",
+        definition: "TEXT PRIMARY KEY",
+    }],
+    indexes: &[],
+    extra_columns: &[],
+}];
+
+/// A repository whose prune always fails, to drive the failure path.
+struct FailingPruneRepository;
+
+impl RecordRepository for FailingPruneRepository {
+    type Record = String;
+
+    fn tables(&self) -> &'static [TableSpec] {
+        WIDGETS
+    }
+
+    fn insert_or_raise(&self, _conn: &Connection, _record: &String) -> Result<bool, KernelError> {
+        Ok(true)
+    }
+
+    fn prune(
+        &self,
+        _conn: &Connection,
+        _max_age_days: u32,
+        _now: f64,
+    ) -> Result<usize, KernelError> {
+        Err(KernelError::io(
+            "prune",
+            Path::new("widgets"),
+            std::io::Error::other("disk full"),
+        ))
+    }
+}
+
+struct SwallowPolicy;
+
+impl FaultPolicy for SwallowPolicy {
+    type Record = String;
+
+    fn on_fault(&self, _fault: &Fault<'_>, _record: &String) -> Outcome {
+        Outcome::swallow()
+    }
+}
+
+fn failing_sink(path: &Path) -> SqliteSink<FailingPruneRepository, SwallowPolicy> {
+    let store = Arc::new(SqliteStore::new(path, false, 1, WIDGETS, None, "[test]").expect("store"));
+    SqliteSink::new(store, FailingPruneRepository, SwallowPolicy, Some(30), true)
+}
+
+#[test]
+fn a_failed_pass_does_not_advance_the_gate_marker() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("events.db");
+    let sink = failing_sink(&path);
+    // The store opens lazily on the first write.
+    sink.write(&String::from("w1"));
+
+    sink.close(1000.0);
+
+    assert!(
+        !maintenance_marker_path(&path).exists(),
+        "a failed prune must not advance the daily gate - the marker belongs to a successful pass only"
+    );
+}
+
+/// A repository whose prune always succeeds, to drive the healthy path.
+struct HealthyRepository;
+
+impl RecordRepository for HealthyRepository {
+    type Record = String;
+
+    fn tables(&self) -> &'static [TableSpec] {
+        WIDGETS
+    }
+
+    fn insert_or_raise(&self, _conn: &Connection, _record: &String) -> Result<bool, KernelError> {
+        Ok(true)
+    }
+
+    fn prune(
+        &self,
+        _conn: &Connection,
+        _max_age_days: u32,
+        _now: f64,
+    ) -> Result<usize, KernelError> {
+        Ok(0)
+    }
+}
+
+fn healthy_sink(path: &Path) -> SqliteSink<HealthyRepository, SwallowPolicy> {
+    let store = Arc::new(SqliteStore::new(path, false, 1, WIDGETS, None, "[test]").expect("store"));
+    SqliteSink::new(store, HealthyRepository, SwallowPolicy, Some(30), true)
+}
+
+#[test]
+fn the_detailed_outcome_reports_failure_and_retries() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("events.db");
+    let sink = failing_sink(&path);
+    sink.write(&String::from("w1"));
+
+    assert!(matches!(
+        sink.run_maintenance_detailed(1000.0),
+        MaintenanceOutcome::Failed(_)
+    ));
+    assert!(
+        !maintenance_marker_path(&path).exists(),
+        "the marker only belongs to a successful pass"
+    );
+    // The gate did not advance, so the next attempt retries instead of
+    // waiting a full window.
+    assert!(matches!(
+        sink.run_maintenance_detailed(1001.0),
+        MaintenanceOutcome::Failed(_)
+    ));
+    sink.close(1002.0);
+}
+
+#[test]
+fn the_detailed_outcome_reports_ran_then_not_due() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("events.db");
+    let sink = healthy_sink(&path);
+    sink.write(&String::from("w1"));
+
+    assert_eq!(
+        sink.run_maintenance_detailed(1000.0),
+        MaintenanceOutcome::Ran
+    );
+    assert!(maintenance_marker_path(&path).exists());
+    assert_eq!(
+        sink.run_maintenance_detailed(1001.0),
+        MaintenanceOutcome::NotDue
+    );
+    sink.close(1002.0);
+}

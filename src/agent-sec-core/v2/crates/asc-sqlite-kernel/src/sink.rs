@@ -293,22 +293,72 @@ impl<R: RecordRepository, P: FaultPolicy<Record = R::Record>> SqliteSink<R, P> {
             return;
         }
         let _ = run_sqlite_maintenance_if_due(self.store.path(), None, Some(now), || {
-            self.run_maintenance(now);
-            Ok(())
+            self.run_maintenance(now)
         });
         self.store.close();
     }
 
-    /// Prunes according to the retention window and truncates the WAL.
-    pub fn run_maintenance(&self, now: f64) {
-        let _ = self.store.with_connection(false, |conn| {
-            if let Some(days) = self.max_age_days {
-                self.repository.prune(conn, days, now)?;
-            }
-            self.repository.checkpoint(conn);
-            Ok(())
+    /// Runs the gated maintenance pass without closing the store, with the
+    /// outcome surfaced for the caller's diagnostics.
+    ///
+    /// The long-lived daemon composes this into its periodic retention task;
+    /// [`SqliteSink::close`] remains the one-shot exit path. A failed pass
+    /// does not advance the gate's marker, so the next call retries instead
+    /// of waiting a full window.
+    #[must_use]
+    pub fn run_maintenance_detailed(&self, now: f64) -> MaintenanceOutcome {
+        if !self.store.is_open() {
+            return MaintenanceOutcome::NotDue;
+        }
+        let mut failure = None;
+        let ran = run_sqlite_maintenance_if_due(self.store.path(), None, Some(now), || {
+            self.run_maintenance(now).inspect_err(|error| {
+                failure = Some(error.to_string());
+            })
         });
+        match failure {
+            Some(error) => MaintenanceOutcome::Failed(error),
+            None if ran => MaintenanceOutcome::Ran,
+            None => MaintenanceOutcome::NotDue,
+        }
     }
+
+    /// Prunes according to the retention window and truncates the WAL.
+    ///
+    /// Errors propagate so the maintenance gate does not advance its marker
+    /// over a failed pass - a swallowed error here used to make the next
+    /// retry wait a full window while the expired rows stayed in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError`] when the prune fails, the connection cannot
+    /// be taken, or the store is permanently disabled.
+    pub fn run_maintenance(&self, now: f64) -> Result<(), KernelError> {
+        self.store
+            .with_connection(false, |conn| {
+                if let Some(days) = self.max_age_days {
+                    self.repository.prune(conn, days, now)?;
+                }
+                self.repository.checkpoint(conn);
+                Ok(())
+            })?
+            .ok_or(KernelError::Disabled)
+    }
+}
+
+/// The outcome of one gated maintenance attempt.
+///
+/// `NotDue` also covers a contended lock: both mean "nothing ran, try again
+/// later", which is all a caller scheduling the next check needs to know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintenanceOutcome {
+    /// The gate was closed (or the lock contended); nothing ran.
+    NotDue,
+    /// The pass ran and the marker advanced.
+    Ran,
+    /// The pass failed; the marker was not advanced, so the next attempt
+    /// retries rather than waiting a full window.
+    Failed(String),
 }
 
 impl<R: RecordRepository, P: FaultPolicy<Record = R::Record>> std::fmt::Debug for SqliteSink<R, P> {

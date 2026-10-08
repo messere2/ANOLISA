@@ -40,7 +40,7 @@ pub use schema::{
     ColumnSpec, ExtraColumn, IndexSpec, TableSpec, ensure_schema, ensure_schema_if_needed,
     is_valid_identifier, warn_readonly_schema_readiness,
 };
-pub use sink::SqliteSink;
+pub use sink::{MaintenanceOutcome, SqliteSink};
 pub use store::SqliteStore;
 
 /// Compile-time assertion that `T` is `Send`.

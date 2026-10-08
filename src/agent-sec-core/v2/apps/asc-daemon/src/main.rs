@@ -16,7 +16,7 @@ use asc_daemon::{Cli, ParseOutcome, ProcessSignals, run_with_shutdown_timeout, s
 use asc_daemon_core::{PrincipalPolicy, RootManagedPrincipalPolicy};
 use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder};
 use asc_daemon_service::ShutdownToken;
-use asc_event_sink::ConfiguredSecurityEventSinks;
+use asc_event_sink::{ConfiguredSecurityEventSinks, MaintenanceOutcome};
 use asc_pap::PapService;
 use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_policy_engine::PolicyTemplateCompiler;
@@ -26,6 +26,15 @@ use asc_security_events::config::daemon_security_event_paths;
 use crate::sinks::EventSinkAdapter;
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How often a running daemon re-checks the security-event `SQLite`
+/// retention gate. The gate itself stays the shared daily window; this is
+/// only the cadence at which a long-lived daemon looks at it.
+const RETENTION_CHECK_INTERVAL_SECONDS: u64 = 3600;
+
+/// How quickly a failed retention pass is retried. The gate does not
+/// advance over a failure, so the retry is bounded only by this backoff.
+const RETENTION_FAILURE_RETRY_SECONDS: u64 = 60;
 
 fn main() -> ExitCode {
     install_panic_hook();
@@ -168,6 +177,7 @@ async fn run(
     let health_task = policy_runtime
         .as_ref()
         .map(|runtime| watch_policy_health(runtime.enqueuer(), telemetry.reporter()));
+    let retention_task = spawn_retention_task(Arc::clone(&durable_sinks.security), telemetry.reporter());
     let signal_task = tokio::spawn(signals.request_shutdown(shutdown.clone()));
     let result = serve(
         cli.bootstrap,
@@ -180,6 +190,7 @@ async fn run(
     if let Some(health_task) = health_task {
         health_task.abort();
     }
+    retention_task.abort();
     // UDS has stopped admission and completed its request drain before workers stop.
     let exit_code = if drain_runtimes(skill_worker, policy_runtime).await {
         match result {
@@ -322,6 +333,56 @@ fn report_error(telemetry: &asc_observability::TelemetryRuntime, problem: &dyn s
         telemetry.report(&format!("  caused by: {cause}"));
         source = cause.source();
     }
+}
+
+/// Periodic security-event `SQLite` retention for the long-lived daemon.
+///
+/// v1 ran retention when short-lived CLI processes exited through `atexit`,
+/// and the daemon only ran the gated pass in `event_sinks.close()` after its
+/// main loop returned - a daemon that keeps running never pruned, and a hard
+/// kill skipped the shutdown pass entirely, so expired events survived until
+/// some orderly exit. The task's first tick fires immediately (the startup
+/// catch-up after a hard kill); later ticks re-check the shared
+/// cross-process gate. Failures surface through diagnostics and retry after
+/// a short backoff; the gate advances its marker only on success. The
+/// `SQLite` work crosses the blocking boundary and never blocks scans; the
+/// bounded final pass in `event_sinks.close()` still runs at shutdown.
+fn spawn_retention_task(
+    sinks: Arc<ConfiguredSecurityEventSinks>,
+    report: impl Fn(&str) + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs(RETENTION_CHECK_INTERVAL_SECONDS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            loop {
+                let sinks = Arc::clone(&sinks);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |delta| delta.as_secs_f64());
+                let pass =
+                    tokio::task::spawn_blocking(move || sinks.run_sqlite_retention(now)).await;
+                match pass {
+                    Ok(MaintenanceOutcome::Failed(error)) => {
+                        report(&format!(
+                            "agent-sec-daemon: security event sqlite retention failed, retrying: {error}"
+                        ));
+                        tokio::time::sleep(Duration::from_secs(RETENTION_FAILURE_RETRY_SECONDS))
+                            .await;
+                    }
+                    Ok(_) => break,
+                    Err(join) => {
+                        report(&format!(
+                            "agent-sec-daemon: security event sqlite retention task panicked: {join}"
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn watch_policy_health(
