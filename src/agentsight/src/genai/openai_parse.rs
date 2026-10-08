@@ -350,11 +350,40 @@ impl GenAIBuilder {
                 response: response_val,
             });
         } else {
-            // Text content
+            // Text content: one Text part per non-empty block, the same walk
+            // `parse_request_body`'s raw fallback and the Anthropic mapping
+            // use, so `joined_text_parts` joins the blocks with a newline
+            // exactly like the raw path's `extract_message_text`.
+            // Pre-flattening through `as_text` joined the blocks with ""
+            // instead, so the same request produced different
+            // session/conversation LRU keys at request time (peek / crash
+            // fallback) than at completion time (resolve): a crashed call
+            // landed in a synthetic bucket instead of its real conversation,
+            // and the drain path's `finish_conversation` eviction missed the
+            // anchor it meant to evict.
             if let Some(ref c) = m.content {
-                let text = c.as_text();
-                if !text.is_empty() {
-                    parts.push(MessagePart::Text { content: text });
+                match c {
+                    crate::analyzer::message::types::OpenAIContent::Text(text) => {
+                        if !text.is_empty() {
+                            parts.push(MessagePart::Text {
+                                content: text.clone(),
+                            });
+                        }
+                    }
+                    crate::analyzer::message::types::OpenAIContent::Parts(blocks) => {
+                        for block in blocks {
+                            if let crate::analyzer::message::types::OpenAIContentPart::Text {
+                                text,
+                            } = block
+                            {
+                                if !text.is_empty() {
+                                    parts.push(MessagePart::Text {
+                                        content: text.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

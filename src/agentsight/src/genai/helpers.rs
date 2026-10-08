@@ -1226,6 +1226,86 @@ mod tests {
         );
     }
 
+    /// The interleaved text/image/text user message: one chat-completions
+    /// request whose content array carries two text blocks. Both attribution
+    /// paths must extract the same text from it, or the LRU keys derived at
+    /// request time (peek / crash fallback) and at completion time (resolve)
+    /// disagree.
+    fn multiblock_body() -> serde_json::Value {
+        serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+                    {"type": "text", "text": "what is in the picture"}
+                ]}
+            ]
+        })
+    }
+
+    /// Raw path (pending / crash drain): `extract_messages_view` +
+    /// `extract_message_text` joins the text blocks with "\n".
+    fn raw_last_user_text(body: &serde_json::Value) -> String {
+        let (messages, _) = crate::parser::llm::extract_messages_view(body).unwrap();
+        messages
+            .iter()
+            .rev()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .find_map(GenAIBuilder::extract_message_text)
+            .unwrap()
+    }
+
+    /// Typed path (completion): `OpenAIParser::parse_request` +
+    /// `openai_msg_to_input` + `extract_last_user_raw`.
+    fn typed_last_user_text(body: &serde_json::Value) -> String {
+        let typed = crate::analyzer::message::OpenAIParser::parse_request(body)
+            .expect("chat-completions body must parse");
+        let request = make_llm_request(
+            typed
+                .messages
+                .iter()
+                .map(GenAIBuilder::openai_msg_to_input)
+                .collect(),
+        );
+        GenAIBuilder::extract_last_user_raw(&request).unwrap()
+    }
+
+    #[test]
+    fn test_multiblock_user_text_is_the_same_on_both_paths() {
+        let body = multiblock_body();
+        let raw = raw_last_user_text(&body);
+        let typed = typed_last_user_text(&body);
+        assert_eq!(
+            raw, typed,
+            "the raw (pending/crash) and typed (completion) paths must extract the same \
+             user text, or the session/conversation LRU keys disagree"
+        );
+    }
+
+    #[test]
+    fn test_multiblock_crash_peek_lands_in_the_completed_conversation() {
+        let body = multiblock_body();
+        let raw = raw_last_user_text(&body);
+        let typed = typed_last_user_text(&body);
+
+        let resolver = crate::genai::id_resolver::IdResolver::new();
+        // An earlier call of the same conversation completed: the completion
+        // path anchored the conversation under the typed text.
+        let completed = resolver
+            .resolve_conversation_id("openclaw", 42, &typed, "resp-1", 1)
+            .unwrap();
+        // A later call crashes before its response: the drain path peeks
+        // under the raw text and must land in the same conversation bucket
+        // instead of a synthetic crash bucket.
+        let peeked = resolver.peek_conversation_id("openclaw", 42, &raw, 1);
+        assert_eq!(
+            peeked.as_deref(),
+            Some(completed.as_str()),
+            "the crash-drain peek must hit the anchor the completion path wrote"
+        );
+    }
+
     #[test]
     fn test_resolve_agent_name_from_comm_with_cache() {
         let mut cache = HashMap::new();
