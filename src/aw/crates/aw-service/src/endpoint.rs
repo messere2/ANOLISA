@@ -1,11 +1,13 @@
 //! A private, locked service endpoint removes only the socket inode it created.
 
 use std::{
+    ffi::CString,
     fs::{self, DirBuilder, File, Metadata, OpenOptions},
     io,
     os::{
         fd::AsRawFd,
         unix::{
+            ffi::OsStrExt,
             fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
             net::{UnixListener, UnixStream},
         },
@@ -47,8 +49,25 @@ impl Endpoint {
             return Err(io::Error::last_os_error());
         }
         let socket = state_dir.join("aw.sock");
-        // Existing sockets, including stale ones, require explicit operator cleanup.
-        let listener = UnixListener::bind(&socket)?;
+        // The socket must be private from the instant it is observable at its
+        // final path: launch_service rejects broader modes without retrying,
+        // so a chmod after binding aw.sock races every readiness poll. Bind a
+        // staging name inside this locked state directory, apply the permanent
+        // mode, then rename: the final path appears atomically at 0600.
+        // Existing sockets, including stale ones, require explicit operator
+        // cleanup, and the no-replace rename keeps an unexpected aw.sock
+        // intact instead of silently replacing it.
+        let staged = state_dir.join(".aw.sock.staging");
+        // The service lock serializes binders of this state directory; leftover
+        // staging files are debris from a crashed binder.
+        let _ = fs::remove_file(&staged);
+        let listener = match bind_staged(&staged, &socket) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = fs::remove_file(&staged);
+                return Err(error);
+            }
+        };
         let metadata = fs::symlink_metadata(&socket)?;
         let endpoint = Self {
             listener,
@@ -56,7 +75,6 @@ impl Endpoint {
             identity: (metadata.dev(), metadata.ino()),
             _lock: lock,
         };
-        fs::set_permissions(&endpoint.socket, fs::Permissions::from_mode(0o600))?;
         endpoint.listener.set_nonblocking(true)?;
         Ok(endpoint)
     }
@@ -84,6 +102,34 @@ impl Drop for Endpoint {
 fn current_uid() -> u32 {
     // geteuid has no preconditions and identifies the service's filesystem owner.
     unsafe { libc::geteuid() }
+}
+
+fn bind_staged(staged: &Path, socket: &Path) -> io::Result<UnixListener> {
+    let listener = UnixListener::bind(staged)?;
+    fs::set_permissions(staged, fs::Permissions::from_mode(0o600))?;
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket paths must not contain a NUL byte",
+        )
+    };
+    let staged = CString::new(staged.as_os_str().as_bytes()).map_err(|_| invalid())?;
+    let socket = CString::new(socket.as_os_str().as_bytes()).map_err(|_| invalid())?;
+    // SAFETY: both names are owned, NUL-terminated path strings that remain
+    // valid for the duration of this synchronous system call.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            staged.as_ptr(),
+            libc::AT_FDCWD,
+            socket.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(listener)
 }
 
 fn permission(message: &'static str) -> io::Error {
@@ -158,6 +204,7 @@ mod tests {
     use std::{
         os::unix::fs::symlink,
         sync::atomic::{AtomicU64, Ordering},
+        thread,
         time::{Duration, Instant},
     };
 
@@ -187,6 +234,43 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn socket_permissions_are_private_from_creation() {
+        // The launcher's readiness probe rejects a socket whose mode is broader
+        // than 0600 without retrying, so a chmod after bind() races every
+        // poller. A concurrent observer must never see the broader creation
+        // mode that UnixListener::bind derives from the process umask.
+        let fixture = Fixture::new();
+        for index in 0..8 {
+            let state = fixture.0.join(format!("race-{index}"));
+            DirBuilder::new().mode(0o700).create(&state).unwrap();
+            let socket = state.join("aw.sock");
+            let watcher = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match fs::symlink_metadata(&socket) {
+                        Ok(metadata) => return Some(metadata.mode() & 0o777),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => panic!("{error}"),
+                    }
+                    if Instant::now() > deadline {
+                        return None;
+                    }
+                }
+            });
+            let endpoint = Endpoint::bind(&state).unwrap();
+            let mode = watcher
+                .join()
+                .unwrap()
+                .expect("socket never became observable");
+            assert_eq!(
+                mode, 0o600,
+                "socket was observable with broader permissions"
+            );
+            drop(endpoint);
         }
     }
 
