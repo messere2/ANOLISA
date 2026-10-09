@@ -109,6 +109,14 @@ fn run(cli: &Cli) -> Result<u8, RunError> {
         }
         Plan::Daemon { socket } => socket,
     };
+    // The observability commands page through several query methods whose
+    // offsets depend on earlier responses, so they own their transport loop
+    // instead of sharing the single-request path.
+    if let Some(command) = cli.observability() {
+        return command
+            .run(socket, cli.timeout(), &mut io::stdout().lock())
+            .map_err(|error| RunError::Input(InputError::Observability(error)));
+    }
     // Scan-prompt resolves its own request batch (one per input line or
     // conversation payload) and prints diagnostics around them, so it owns
     // its transport loop instead of sharing the single-request path.

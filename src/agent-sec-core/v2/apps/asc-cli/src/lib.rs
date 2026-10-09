@@ -15,7 +15,8 @@ use asc_foundation_types::{DAEMON_SOCKET_ENV, daemon_socket_path_from_env};
 use clap::Parser;
 use commands::Command;
 pub use commands::{
-    CapabilitiesCommand, EventsCommand, PiiOutputFormat, PromptScanPlan, ScanPromptInputError,
+    CapabilitiesCommand, EventsCommand, ObservabilityError, PiiOutputFormat, PromptScanPlan,
+    ScanPromptInputError,
 };
 
 /// Parsed invocation for one CLI command.
@@ -225,6 +226,11 @@ impl Cli {
     pub const fn events(&self) -> Option<&EventsCommand> {
         self.command.events()
     }
+
+    /// The observability browse/report command, or `None` for another command.
+    pub const fn observability(&self) -> Option<&commands::ObservabilityCommand> {
+        self.command.observability()
+    }
 }
 
 /// Resolves the daemon endpoint from the option, then the environment.
@@ -302,10 +308,18 @@ pub enum InputError {
     /// through [`Cli::prompt_scan_run`], not the single-request path.
     #[error("scan-prompt requests are resolved through prompt_scan_run")]
     PromptScanBatch,
+    /// The observability commands page through their own request batches,
+    /// not the single-request path.
+    #[error("observability commands run their own request batches")]
+    ObservabilityBatch,
     /// A scan-prompt input failure; that command owns its variants and
     /// wording, mirroring V1's scan-specific messages.
     #[error(transparent)]
     ScanPrompt(#[from] ScanPromptInputError),
+    /// An observability command failure; that command owns its variants and
+    /// wording, mirroring V1's report/review messages.
+    #[error(transparent)]
+    Observability(#[from] ObservabilityError),
 }
 
 impl InputError {
@@ -317,6 +331,7 @@ impl InputError {
         match self {
             Self::EmptyCode | Self::Events(_) => true,
             Self::ScanPrompt(error) => error.is_usage_hint(),
+            Self::Observability(error) => error.is_usage_hint(),
             Self::PiiRead(_)
             | Self::PiiUtf8
             | Self::PiiTooLarge
@@ -326,7 +341,8 @@ impl InputError {
             | Self::TooLarge
             | Self::Json(_)
             | Self::LocalCommand
-            | Self::PromptScanBatch => false,
+            | Self::PromptScanBatch
+            | Self::ObservabilityBatch => false,
         }
     }
 }

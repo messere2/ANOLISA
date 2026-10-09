@@ -4,6 +4,7 @@ mod binding;
 mod capabilities;
 mod common;
 mod events;
+mod observability;
 mod policy;
 mod scan_code;
 mod scan_pii;
@@ -17,6 +18,8 @@ use clap::Subcommand;
 use self::binding::BindingCommand;
 pub use self::capabilities::CapabilitiesCommand;
 pub use self::events::EventsCommand;
+pub use self::observability::ObservabilityCommand;
+pub use self::observability::ObservabilityError;
 use self::policy::PolicyCommand;
 use self::scan_code::ScanCodeCommand;
 pub use self::scan_pii::PiiOutputFormat;
@@ -45,6 +48,9 @@ pub(crate) enum Command {
     ScanPrompt(ScanPromptCommand),
     /// List the caller's own security events from the daemon.
     Events(EventsCommand),
+    /// Browse or summarize the caller's own observability sessions.
+    #[command(subcommand)]
+    Observability(ObservabilityCommand),
     /// Manage Skill scanning, signatures, history and activation.
     #[command(subcommand)]
     SkillLedger(skill_ledger::SkillLedgerCommand),
@@ -61,6 +67,10 @@ impl Command {
             Self::ScanCode(command) => command.request(),
             Self::ScanPii(command) => command.request(),
             Self::Events(command) => command.request(),
+            // The observability commands page through several query methods
+            // whose offsets depend on earlier responses, so they run their own
+            // transport loop instead of the single-request path.
+            Self::Observability(_) => Err(InputError::ObservabilityBatch),
             // Scan-prompt resolves its own request batch (it may read stdin
             // or a batch file), so the single-request path refuses it.
             Self::ScanPrompt(_) => Err(InputError::PromptScanBatch),
@@ -73,6 +83,15 @@ impl Command {
     pub(crate) const fn events(&self) -> Option<&EventsCommand> {
         match self {
             Self::Events(command) => Some(command),
+            _ => None,
+        }
+    }
+
+    /// Returns the observability command when this invocation browses or
+    /// summarizes observability sessions.
+    pub(crate) const fn observability(&self) -> Option<&ObservabilityCommand> {
+        match self {
+            Self::Observability(command) => Some(command),
             _ => None,
         }
     }

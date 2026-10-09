@@ -278,13 +278,13 @@ impl EventsCommand {
             .collect();
         let mut line = String::new();
         for (header, width) in headers.iter().zip(&widths) {
-            line.push_str(&format!("{header:<width$}"));
+            write!(line, "{header:<width$}").expect("a String write cannot fail");
         }
         writeln!(stdout, "{}", line.trim_end())?;
         for row in &rows {
             let mut line = String::new();
             for (value, width) in row.iter().zip(&widths) {
-                line.push_str(&format!("{value:<width$}"));
+                write!(line, "{value:<width$}").expect("a String write cannot fail");
             }
             writeln!(stdout, "{}", line.trim_end())?;
         }
