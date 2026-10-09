@@ -505,6 +505,59 @@ Client；shutdown 先关闭请求准入并 drain 请求，再停止领取/扫描
 系统性 fault-injection 交付。完整 CLI/daemon E2E 单独 PR，SQLite/崩溃恢复和系统性注入等待
 persistent Repository；这些边界见 [Runtime 设计](BINDING_RECONCILER_RUNTIME_DESIGN_zh.md)。
 
+### 11.5 **[CURRENT][V2]** security-event SQLite retention 周期服务
+
+此服务由 `v2/apps/asc-daemon/src/retention.rs` 实现，daemon 组合根装配；它不依赖通用
+periodic scheduler 或完整 JobSupervisor。目的：让长驻 daemon 自持 Security Events `SQLite`
+retention（#6602/#6679）——v1 依赖短命 CLI 进程 `atexit` 补做维护，长驻 daemon 永不裁剪，
+SIGKILL/OOM/掉电后重启也不补做，数据库在长期运行的主机上无界增长。
+
+- **trigger**：启动 catch-up 一次（`retention::run_startup_catchup`，在 UDS admission 之前
+  完成），此后每 `check_interval`（默认 1h）重查共享跨进程 daily gate；gate 本身仍决定是否
+  真正执行。pass 内部失败按 `failure_retry`（默认 60s）退避重试。
+- **Ready 关系**：服务不是 readiness-critical，无自己的 Ready gate。admission 只按顺序等待
+  启动 catch-up 这一次 pass 完成；catch-up 失败或 contended 不阻塞 admission，转由周期任务
+  按 `failure_retry` 重试。daemon 完成启动只代表 retention 已排队，不代表已成功。
+- **并发边界**：maintenance 与请求审计写入（finalizer 的 INSERT）共享同一 `SqliteStore`
+  mutex（单连接设计，见 store.rs）。首次（可能很大的历史 backlog）pass 严格前置于 admission；
+  此后每次 pass 至多裁剪一个 gate 窗口（24h）的过期行，请求写入最坏等待一个已收敛 pass。
+  跨进程仍由 `.maintenance.lock` flock 互斥（与 v1 CLI 进程共存；并发 v1 atexit pass 与请求
+  写入的互相等待与 v1-v1 之间一致，不变更）。
+- **失败/重试**：gate 返回结构化结果 `MaintenanceOutcome`（`NotDue`/`Contended`/`Ran`/
+  `Failed`）。`Failed`（prune、lock 文件打开/加锁、marker 写/改名失败）与 `Contended`
+  （他进程持锁）都按 `failure_retry` 退避重试且不推进 marker；`NotDue` 回常规 cadence。pass
+  panic 报告一次后回常规 cadence（panic 是 bug，不按 60s 重试刷屏）。checkpoint 保持 v1
+  best-effort（repository.rs 默认实现吞错），不计入 `Failed`。
+- **health**：服务无请求可见状态，不进 DJOB registry；降级只通过进程 diagnostics 投影
+  （每个 `Failed`/`Contended`/panic/catch-up 与 pass 完成各一条稳定前缀消息）。长驻 health
+  （任务存活、cadence 保持）与最近一次 outcome 分离：任务在 pass 失败或 panic 后继续存活，
+  仅 shutdown 取消它。
+- **日志/tracing**：全部经 daemon diagnostics 通道；不创建自定义 trace ID（对齐 DJOB-023）。
+- **cancellation 与 shutdown**：`RetentionTask` 从不 `abort()`——`spawn_blocking` 闭包不可
+  取消（runtime.rs 记录的语义），abort 后残留 pass 会与 `event_sinks.close()` 的 final pass
+  竞争同一 store mutex。改为：watch channel 协作取消调度；`shutdown` 先取消、再 join 任务
+  本身（任务总是 await 其 in-flight `spawn_blocking` pass，join 完成 ⇒ pass 已终止），此后
+  组合根才执行 final pass——严格后置，不再与残留 maintenance 竞争。join 预算 65s（镜像 skill
+  worker drain 预算）；超时则跳过 final pass（与 SIGKILL 同级的降级：进程退出兜底），daemon
+  以 FAILURE 退出码报告。
+- **restart**：无内存状态；重启后由启动 catch-up + 共享 marker 文件恢复（硬杀补做）。
+
+可执行验收 fixture（`v2/apps/asc-daemon/tests/retention_lifecycle.rs`；DJOB-RET-006 为真
+二进制 + 真 UDS + 生产 schema 种子库，其余为生产任务循环 + scripted pass）：
+
+| ID | 行为 | fixture / test |
+|---|---|---|
+| DJOB-RET-001 | 启动 catch-up 立即首跑一次，随后按 cadence 检查 | `startup_catch_up_runs_once_then_follows_the_cadence` |
+| DJOB-RET-002 | catch-up 失败不阻塞 admission，按退避重试 | `a_failed_catch_up_schedules_the_backoff_retry` |
+| DJOB-RET-003 | Failed pass 按退避重试、逐次诊断 | `a_failed_pass_retries_after_the_backoff` |
+| DJOB-RET-004 | Contended pass 报告并按退避重试 | `a_contended_pass_retries_after_the_backoff` |
+| DJOB-RET-005 | panic pass 报告一次、任务存活、回常规 cadence | `a_panicking_pass_is_reported_and_the_task_survives` |
+| DJOB-RET-006 | admission 前置：首次 connect 即见 backlog 已裁剪且 marker 已写 | `startup_catch_up_prunes_the_backlog_before_admission` |
+| DJOB-RET-007 | shutdown join 等待 in-flight pass 终止后才返回 | `shutdown_joins_an_in_flight_pass_before_returning` |
+| DJOB-RET-008 | join 超时返回 false（调用方须跳过 final pass） | `a_stuck_pass_times_out_the_terminal_join` |
+
+运行入口：`cargo test -p asc-daemon --test retention_lifecycle --locked --offline`。
+
 ## 12. 当前实现证据
 
 - 通用 Job interface、status、one-shot、periodic 和 manager：

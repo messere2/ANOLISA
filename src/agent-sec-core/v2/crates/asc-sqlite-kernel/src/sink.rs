@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::error::{KernelError, is_busy, is_corruption, is_schema};
 use crate::fault::{Failure, Fault, FaultPolicy, Phase, WriteFault};
-use crate::maintenance::run_sqlite_maintenance_if_due;
+use crate::maintenance::{run_sqlite_maintenance_detailed, run_sqlite_maintenance_if_due};
 use crate::repository::RecordRepository;
 use crate::store::SqliteStore;
 
@@ -299,28 +299,23 @@ impl<R: RecordRepository, P: FaultPolicy<Record = R::Record>> SqliteSink<R, P> {
     }
 
     /// Runs the gated maintenance pass without closing the store, with the
-    /// outcome surfaced for the caller's diagnostics.
+    /// gate's outcome surfaced for the caller's diagnostics.
     ///
     /// The long-lived daemon composes this into its periodic retention task;
-    /// [`SqliteSink::close`] remains the one-shot exit path. A failed pass
-    /// does not advance the gate's marker, so the next call retries instead
-    /// of waiting a full window.
+    /// [`SqliteSink::close`] remains the one-shot exit path. The structured
+    /// outcome distinguishes a closed gate ([`MaintenanceOutcome::NotDue`])
+    /// from a contended lock ([`MaintenanceOutcome::Contended`]) and from real
+    /// failures ([`MaintenanceOutcome::Failed`]): lock-file, prune, and marker
+    /// failures all report `Failed` and leave the marker unadvanced, so the
+    /// next call retries instead of waiting a full window.
     #[must_use]
     pub fn run_maintenance_detailed(&self, now: f64) -> MaintenanceOutcome {
         if !self.store.is_open() {
             return MaintenanceOutcome::NotDue;
         }
-        let mut failure = None;
-        let ran = run_sqlite_maintenance_if_due(self.store.path(), None, Some(now), || {
-            self.run_maintenance(now).inspect_err(|error| {
-                failure = Some(error.to_string());
-            })
-        });
-        match failure {
-            Some(error) => MaintenanceOutcome::Failed(error),
-            None if ran => MaintenanceOutcome::Ran,
-            None => MaintenanceOutcome::NotDue,
-        }
+        run_sqlite_maintenance_detailed(self.store.path(), None, Some(now), || {
+            self.run_maintenance(now)
+        })
     }
 
     /// Prunes according to the retention window and truncates the WAL.
@@ -348,16 +343,22 @@ impl<R: RecordRepository, P: FaultPolicy<Record = R::Record>> SqliteSink<R, P> {
 
 /// The outcome of one gated maintenance attempt.
 ///
-/// `NotDue` also covers a contended lock: both mean "nothing ran, try again
-/// later", which is all a caller scheduling the next check needs to know.
+/// The gate's own failures are surfaced rather than folded into `NotDue`:
+/// a lock held by another process is [`MaintenanceOutcome::Contended`], and
+/// lock-file, prune, or marker failures are [`MaintenanceOutcome::Failed`].
+/// None of them advance the gate's marker, so for a caller the practical
+/// difference is only in diagnostics and retry policy - `NotDue` returns to
+/// the regular cadence, the others retry sooner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MaintenanceOutcome {
-    /// The gate was closed (or the lock contended); nothing ran.
+    /// The gate was closed; nothing ran.
     NotDue,
+    /// Another process held the maintenance lock; nothing ran.
+    Contended,
     /// The pass ran and the marker advanced.
     Ran,
-    /// The pass failed; the marker was not advanced, so the next attempt
-    /// retries rather than waiting a full window.
+    /// The pass or the gate itself failed; the marker was not advanced, so the
+    /// next attempt retries rather than waiting a full window.
     Failed(String),
 }
 

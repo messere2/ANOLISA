@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use asc_sqlite_kernel::maintenance::maintenance_marker_path;
+use asc_sqlite_kernel::maintenance::{maintenance_lock_path, maintenance_marker_path};
 use asc_sqlite_kernel::{
     ColumnSpec, Fault, FaultPolicy, KernelError, MaintenanceOutcome, Outcome, RecordRepository,
     SqliteSink, SqliteStore, TableSpec,
@@ -151,6 +151,93 @@ fn the_detailed_outcome_reports_ran_then_not_due() {
     assert_eq!(
         sink.run_maintenance_detailed(1001.0),
         MaintenanceOutcome::NotDue
+    );
+    sink.close(1002.0);
+}
+
+// #6679 review follow-up: gate-internal failures (lock contention, lock-file
+// open failures, marker write failures) are real, diagnosable outcomes and
+// must not masquerade as `NotDue` - `NotDue` sends the caller back to the
+// hourly cadence with no diagnostic and no retry.
+
+/// Holds the gate's cross-process lock the way a concurrent v1 process would.
+fn hold_the_maintenance_lock(path: &Path) -> std::fs::File {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(maintenance_lock_path(path))
+        .expect("open lock file");
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .expect("hold lock");
+    lock
+}
+
+#[test]
+fn a_contended_gate_is_not_reported_as_not_due() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("events.db");
+    let sink = healthy_sink(&path);
+    sink.write(&String::from("w1"));
+
+    let held = hold_the_maintenance_lock(&path);
+    assert_ne!(
+        sink.run_maintenance_detailed(1000.0),
+        MaintenanceOutcome::NotDue,
+        "a contended gate is a distinct, diagnosable state - not an absence of work"
+    );
+    assert!(
+        matches!(
+            sink.run_maintenance_detailed(1001.0),
+            MaintenanceOutcome::Contended
+        ),
+        "the still-open gate under contention must report Contended"
+    );
+    drop(held);
+    assert_eq!(
+        sink.run_maintenance_detailed(1002.0),
+        MaintenanceOutcome::Ran,
+        "once the lock is free the still-open gate must run"
+    );
+    sink.close(1003.0);
+}
+
+#[test]
+fn a_lock_open_failure_is_not_reported_as_not_due() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("events.db");
+    let sink = healthy_sink(&path);
+    sink.write(&String::from("w1"));
+    // A directory at the lock path makes the lock-file open fail for real.
+    std::fs::create_dir(maintenance_lock_path(&path)).expect("block the lock path");
+
+    assert!(
+        matches!(
+            sink.run_maintenance_detailed(1000.0),
+            MaintenanceOutcome::Failed(_)
+        ),
+        "a lock-file open failure is an error, not a closed gate"
+    );
+    sink.close(1002.0);
+}
+
+#[test]
+fn a_marker_write_failure_is_not_reported_as_not_due() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("events.db");
+    let sink = healthy_sink(&path);
+    sink.write(&String::from("w1"));
+    // A directory at the marker path makes the atomic marker rename fail while
+    // the prune itself succeeds.
+    std::fs::create_dir(maintenance_marker_path(&path)).expect("block the marker path");
+
+    assert!(
+        matches!(
+            sink.run_maintenance_detailed(1000.0),
+            MaintenanceOutcome::Failed(_)
+        ),
+        "a marker write failure is an error - the gate did not advance and the caller must retry"
     );
     sink.close(1002.0);
 }
