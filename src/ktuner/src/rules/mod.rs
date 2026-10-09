@@ -1746,6 +1746,10 @@ fn eval_vfs_cache_pressure(info: &SystemInfo, recs: &mut Vec<Recommendation>) ->
         || info.has_process("mongod")
         || info.has_process("clickhouse")
         || info.has_process("redis-server")
+        // valkey-server is the Linux Foundation's Redis 7.2.4 fork: the same
+        // event-loop, memory-resident cache workload behind a drop-in binary,
+        // so it needs the same dentry/inode cache retention.
+        || info.has_process("valkey-server")
         || info.has_process("memcached")
         || info.has_process("etcd")
         || info.has_process("elasticsearch");
@@ -8709,6 +8713,23 @@ mod tests {
             recs.iter().all(|r| !r.param.contains("hugepage")),
             "a streaming workload is not latency-sensitive"
         );
+    }
+
+    #[test]
+    fn test_vfs_cache_pressure_with_valkey() {
+        // valkey-server is the Redis 7.2.4 fork running the same memory-resident
+        // cache workload, so a Valkey host needs the same dentry/inode cache
+        // retention a redis-server host already gets; a build job must not.
+        let mut info = make_test_info();
+        info.processes = vec![ProcessInfo {
+            name: "valkey-server".to_string(),
+        }];
+        let recs = evaluate(&info).unwrap().recommendations;
+        let rec = recs
+            .iter()
+            .find(|r| r.param == "vm.vfs_cache_pressure")
+            .expect("valkey-server must get the vfs_cache_pressure recommendation");
+        assert_eq!(rec.recommended_value, "50");
     }
 
     #[test]
