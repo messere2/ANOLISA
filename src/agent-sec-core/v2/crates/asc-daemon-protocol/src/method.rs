@@ -1,9 +1,12 @@
 //! Closed daemon method inventory and access metadata.
 //!
-//! Two method families exist: PAP administration, which requires a Policy
-//! administrator, and Action capabilities, which any authenticated local peer
-//! may call. Keeping both in one closed inventory means an unregistered method
-//! is rejected before authorization rather than defaulting into a family.
+//! Three method families exist: PAP administration, which requires a Policy
+//! administrator; Action capabilities, which any authenticated local peer
+//! may call; and read-only dashboard queries, which any authenticated local
+//! peer may call but which are additionally row-scoped to the caller's owner
+//! by the handler. Keeping all of them in one closed inventory means an
+//! unregistered method is rejected before authorization rather than
+//! defaulting into a family.
 
 /// Create one Policy identity from an authored template.
 pub const POLICY_TEMPLATES_CREATE: &str = "policy.templates.create";
@@ -47,6 +50,15 @@ pub const ACTION_PROMPT_SCAN_WARMUP: &str = "action.prompt_scan.warmup";
 /// Manage Skill scanning, integrity, history and activation.
 pub const ACTION_SKILL_SEC: &str = "action.skill_sec";
 
+/// Return the dashboard summary of the caller's own security events.
+pub const SEC_SUMMARY: &str = "sec.summary";
+/// List the caller's own security events, newest first.
+pub const SEC_EVENTS_LIST: &str = "sec.events.list";
+/// Return one of the caller's own security events by id.
+pub const SEC_EVENTS_GET: &str = "sec.events.get";
+/// Count the caller's own security events grouped by one field.
+pub const SEC_EVENTS_COUNT_BY: &str = "sec.events.count_by";
+
 /// Complete PAP method inventory for this protocol version.
 pub const PAP_METHODS: [&str; 15] = [
     POLICY_TEMPLATES_CREATE,
@@ -73,6 +85,19 @@ pub const ACTION_METHODS: [&str; 5] = [
     ACTION_PROMPT_SCAN,
     ACTION_PROMPT_SCAN_WARMUP,
     ACTION_SKILL_SEC,
+];
+
+/// Complete read-only query method inventory for this protocol version.
+///
+/// The v1 observability query methods (`obs.sessions.list`, `obs.runs.list`,
+/// `obs.timeline.get`) stay outside this inventory until the observability
+/// stream carries an owner column, because exposing them without one would
+/// turn the system daemon into a cross-UID reader (issue #6608).
+pub const QUERY_METHODS: [&str; 4] = [
+    SEC_SUMMARY,
+    SEC_EVENTS_LIST,
+    SEC_EVENTS_GET,
+    SEC_EVENTS_COUNT_BY,
 ];
 
 /// One Policy operation resolved from its exact wire method.
@@ -146,6 +171,19 @@ pub enum ActionMethod {
     SkillSec,
 }
 
+/// One read-only security-event query resolved from its exact wire method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryMethod {
+    /// Dashboard aggregates plus the newest rows.
+    Summary,
+    /// Paginated rows, newest first.
+    EventsList,
+    /// One row by id, scoped to the caller.
+    EventsGet,
+    /// Grouped counts over the caller's rows.
+    EventsCountBy,
+}
+
 /// Closed daemon method identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodId {
@@ -153,6 +191,8 @@ pub enum MethodId {
     Pap(PapMethod),
     /// Action capability method.
     Action(ActionMethod),
+    /// Read-only owner-scoped query method.
+    Query(QueryMethod),
 }
 
 /// Server-owned access policy for a method.
@@ -183,7 +223,12 @@ impl MethodId {
             Self::Pap(_) => Metadata {
                 access: AccessPolicy::PolicyAdministrator,
             },
-            Self::Action(_) => Metadata {
+            // Action capabilities and read-only queries share one access
+            // policy: any kernel-authenticated local peer. The query family
+            // adds row-level owner scoping inside its handler, derived from
+            // the transport-authenticated principal rather than from the
+            // request.
+            Self::Action(_) | Self::Query(_) => Metadata {
                 access: AccessPolicy::LocalUser,
             },
         }
@@ -213,6 +258,10 @@ pub fn resolve(method: &str) -> Option<MethodId> {
         ACTION_PROMPT_SCAN => Some(MethodId::Action(ActionMethod::PromptScan)),
         ACTION_PROMPT_SCAN_WARMUP => Some(MethodId::Action(ActionMethod::PromptScanWarmup)),
         ACTION_SKILL_SEC => Some(MethodId::Action(ActionMethod::SkillSec)),
+        SEC_SUMMARY => Some(MethodId::Query(QueryMethod::Summary)),
+        SEC_EVENTS_LIST => Some(MethodId::Query(QueryMethod::EventsList)),
+        SEC_EVENTS_GET => Some(MethodId::Query(QueryMethod::EventsGet)),
+        SEC_EVENTS_COUNT_BY => Some(MethodId::Query(QueryMethod::EventsCountBy)),
         _ => None,
     }
 }
