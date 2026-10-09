@@ -49,7 +49,17 @@ const MAX_FAST_FAILURES: u32 = 5;
 /// Poll interval while waiting on the worker child.
 const WORKER_POLL_MS: u64 = 200;
 /// How long the client waits for the mount to become ready before failing.
-const READY_TIMEOUT_MS: u64 = 10_000;
+///
+/// The worker pays the full mount startup cost before the FUSE session
+/// serves: the 24-command environment probe (`EnvironmentProfile::detect`
+/// spawns one `which` per whitelisted command) plus store discovery and the
+/// session start. On a host with slow process spawns (WSL, network home
+/// directories) that probe alone was measured at ~10 s, so a 10 s budget
+/// tore down a worker that was still probing — the readiness failure
+/// surfaced an empty worker log tail, the classic still-starting shape.
+/// 30 s keeps the same slow-startup regime inside the budget while the
+/// failure path (supervisor died, worker crashed) still reports quickly.
+const READY_TIMEOUT_MS: u64 = 30_000;
 /// How long `stop` waits for processes to exit / the mount to disappear.
 const STOP_TIMEOUT_MS: u64 = 10_000;
 
@@ -295,7 +305,13 @@ pub fn normalize_mountpoint(mountpoint: &Path) -> PathBuf {
 /// Stable, collision-resistant instance id derived from a normalized path.
 ///
 /// Combines a sanitized basename (for human readability) with a hash of the
-/// full path (for uniqueness).
+/// full path (for uniqueness). The id must never start with a non-alphanumeric
+/// character: it is passed as the value of `--instance` (a leading `-` makes
+/// the argument parser read it as an option, so the supervisor dies before
+/// writing its pid file) and it prefixes every runtime file name. A
+/// dot-prefixed mountpoint — the shape every test harness's tempdir has —
+/// sanitizes to a leading dash, so leading non-alphanumerics are stripped
+/// before the readable prefix is cut.
 pub fn instance_id_for(normalized: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     normalized.as_os_str().hash(&mut hasher);
@@ -313,6 +329,7 @@ pub fn instance_id_for(normalized: &Path) -> String {
                 '-'
             }
         })
+        .skip_while(|c| !c.is_ascii_alphanumeric())
         .take(24)
         .collect();
     let base = if base.is_empty() {
@@ -1174,6 +1191,28 @@ mod tests {
         let id = instance_id_for(Path::new("/var/run/my.mount point"));
         // Non-alphanumerics in the basename become dashes.
         assert!(id.starts_with("my-mount-point-"), "got: {id}");
+    }
+
+    #[test]
+    fn instance_id_never_leads_with_a_dash() {
+        // A dot-prefixed mountpoint — the shape every test harness tempdir
+        // has — used to sanitize to a leading dash, which the supervisor's
+        // `--instance` argument rejected as an option-looking value: the
+        // supervisor died before writing its pid file and the client
+        // reported a readiness timeout with an empty worker log.
+        let id = instance_id_for(Path::new("/tmp/.tmpAbCdEf"));
+        assert!(
+            id.starts_with("tmpAbCdEf-"),
+            "the dot must not become a leading dash, got: {id}"
+        );
+        assert!(
+            id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()),
+            "ids are argv values and file-name prefixes; they must start alphanumeric, got: {id}"
+        );
+        // A basename of only non-alphanumerics still yields the root
+        // fallback, and uniqueness rides on the path hash either way.
+        let dots = instance_id_for(Path::new("/tmp/..."));
+        assert!(dots.starts_with("root-"), "got: {dots}");
     }
 
     #[test]

@@ -2436,6 +2436,144 @@ fn control_socket_with_decision_command_fails_startup() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
+fn managed_mount_serves_a_dot_prefixed_mountpoint() {
+    // Every test harness's tempdir is dot-prefixed (`tempfile` uses a
+    // `.tmp*` prefix), and the derived instance id used to sanitize the
+    // leading dot into a leading dash — which the supervisor's `--instance`
+    // argument rejects as an option-looking value. The supervisor then
+    // died before writing its pid file, so the client's liveness check
+    // never fired either: it polled the full readiness budget and failed
+    // with "did not become ready" and an empty worker log tail, pointing
+    // every investigation at the wrong layer.
+    let source = empty_source();
+    let mount_parent = tempfile::tempdir().expect("mount parent tempdir");
+    let mount = mount_parent.path().join(".mnt");
+
+    let out = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.to_str().unwrap(),
+            "--managed",
+        ])
+        .output()
+        .expect("invoke skillfs");
+
+    // Stop the instance before asserting, so a failure does not leak a
+    // detached supervisor and a live FUSE mount into later tests.
+    let stop = Command::new(bin_path())
+        .args(["stop", mount.to_str().unwrap()])
+        .output()
+        .expect("invoke skillfs stop");
+
+    assert!(
+        out.status.success(),
+        "a dot-prefixed mountpoint must be servable, got: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        combined.contains("managed mount ready"),
+        "expected the ready line, got: {combined}"
+    );
+    assert!(
+        stop.status.success(),
+        "stop must clean up the instance, got: {}{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
+    );
+}
+
+#[test]
+fn managed_mount_survives_a_slow_environment_probe() {
+    // The managed worker pays the full mount startup cost before the FUSE
+    // session serves: the 24-command environment probe
+    // (`EnvironmentProfile::detect` spawns one `which` per whitelisted
+    // command) plus store discovery and the session start. On a host with
+    // slow process spawns (WSL, network home directories) that probe alone
+    // costs ~10 s, so a 10 s readiness budget tore down a worker that was
+    // still probing — `skillfs mount --managed` failed on hardware the
+    // blocking mode serves fine. The budget must cover that regime.
+    //
+    // Deterministic on any host: a `which` shim prepended to the PATH
+    // sleeps half a second per probe, so the worker's startup holds at
+    // least 24 x 0.5 s = 12 s of wall clock regardless of machine speed —
+    // comfortably past a 10 s budget, well inside a 30 s one.
+    //
+    // A non-dot mountpoint keeps this test about the budget alone: a
+    // dot-prefixed one would fail for the instance-id reason covered by
+    // `managed_mount_serves_a_dot_prefixed_mountpoint` instead.
+    let source = empty_source();
+    let mount_parent = tempfile::tempdir().expect("mount parent tempdir");
+    let mount = mount_parent.path().join("mnt");
+
+    // The shim answers "present" for every probe: claiming the whole
+    // whitelist is harmless for an empty source (nothing compiles against
+    // the profile), and skipping the delegation to the real `which` keeps
+    // the per-probe cost to one shell spawn plus the sleep, so the bounds
+    // hold on slow-spawn hosts (WSL) as well as fast CI runners.
+    let shim_dir = tempfile::tempdir().expect("shim tempdir");
+    let which = shim_dir.path().join("which");
+    std::fs::write(&which, "#!/bin/sh\nsleep 0.5\nexit 0\n").expect("write which shim");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&which, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod which shim");
+    }
+
+    let path = std::env::var_os("PATH").expect("PATH");
+    let mut prefixed_path = std::ffi::OsString::from(shim_dir.path());
+    prefixed_path.push(":");
+    prefixed_path.push(&path);
+
+    let out = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.to_str().unwrap(),
+            "--managed",
+        ])
+        .env("PATH", &prefixed_path)
+        .output()
+        .expect("invoke skillfs");
+
+    // Stop the instance before asserting, so a failure does not leak a
+    // detached supervisor and a live FUSE mount into later tests.
+    let stop = Command::new(bin_path())
+        .args(["stop", mount.to_str().unwrap()])
+        .env("PATH", &prefixed_path)
+        .output()
+        .expect("invoke skillfs stop");
+
+    assert!(
+        out.status.success(),
+        "managed mount must survive a slow environment probe, got: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        combined.contains("managed mount ready"),
+        "expected the ready line, got: {combined}"
+    );
+    assert!(
+        stop.status.success(),
+        "stop must clean up the instance, got: {}{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
+    );
+}
+
+#[test]
 fn managed_mount_parses_and_rejects_missing_source() {
     // `--managed` must parse, and the managed client must fail fast with a
     // clear source error before detaching a supervisor — proving the flag is
