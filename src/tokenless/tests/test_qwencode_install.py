@@ -9,6 +9,9 @@ import unittest
 from pathlib import Path
 
 INSTALLER = Path(__file__).resolve().parents[1] / "adapters/tokenless/qwencode/scripts/install.sh"
+UNINSTALLER = (
+    Path(__file__).resolve().parents[1] / "adapters/tokenless/qwencode/scripts/uninstall.sh"
+)
 
 
 class QwenCodeInstallTests(unittest.TestCase):
@@ -153,6 +156,50 @@ esac
                 "extensions list",
             ],
         )
+
+    def run_uninstall(self, dry_run: bool) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(UNINSTALLER)],
+            env={
+                **os.environ,
+                "HOME": str(self.home),
+                "QWEN_BIN": str(self.cli),
+                "QWEN_TEST_ROOT": str(self.root),
+                "ANOLISA_DRY_RUN": "1" if dry_run else "0",
+                "ANOLISA_COMPONENT": "tokenless",
+                "ANOLISA_TARGET": "qwencode",
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    def test_dry_run_uninstall_preserves_extension_and_skips_cli(self) -> None:
+        self.installed.write_text("original registration", encoding="utf-8")
+        extension_dir = self.home / ".qwen" / "extensions" / "tokenless"
+        extension_dir.mkdir(parents=True)
+        extension_file = extension_dir / "qwen-extension.json"
+        extension_file.write_text('{"name":"tokenless"}', encoding="utf-8")
+
+        result = self.run_uninstall(dry_run=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DRY-RUN:", result.stdout)
+        self.assertFalse(self.log.exists(), "dry-run uninstall must not invoke the Qwen CLI")
+        self.assertTrue(
+            self.installed.exists(), "dry-run uninstalled the live extension registration"
+        )
+        self.assertTrue(extension_file.exists(), "dry-run removed the extension directory")
+
+    def test_real_uninstall_removes_the_extension(self) -> None:
+        self.installed.write_text("registration", encoding="utf-8")
+
+        result = self.run_uninstall(dry_run=False)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("extensions uninstall tokenless", self.log.read_text())
+        self.assertFalse(self.installed.exists())
 
 
 if __name__ == "__main__":
