@@ -114,10 +114,21 @@ impl TokenParser {
         // Gemini's wire counters are camelCase (`promptTokenCount` /
         // `candidatesTokenCount` under `usageMetadata`); the snake_case
         // spellings stay as the gateway fallback, mirroring
-        // `extract_usage_object`'s Gemini arm.
+        // `extract_usage_object`'s Gemini arm. Thinking models report their
+        // reasoning budget in `thoughtsTokenCount`, outside
+        // `candidatesTokenCount`, and it is billed as output — the direct
+        // parse folds it in, and the scan is the continuation recovery for
+        // the very responses most likely to be split across records, so it
+        // must do the same or a thinking model's recovered record undercounts
+        // its output by the whole reasoning budget.
         let gemini_input = find_u64(data, "promptTokenCount");
-        let gemini_output = find_u64(data, "candidatesTokenCount");
-        let is_gemini = gemini_input.is_some() || gemini_output.is_some();
+        let gemini_candidates = find_u64(data, "candidatesTokenCount");
+        let gemini_thoughts = find_u64(data, "thoughtsTokenCount")
+            .or_else(|| find_u64(data, "thoughts_token_count"))
+            .unwrap_or(0);
+        let gemini_output =
+            gemini_candidates.map(|candidates| candidates.saturating_add(gemini_thoughts));
+        let is_gemini = gemini_input.is_some() || gemini_candidates.is_some();
         let input = find_u64(data, "input_tokens")
             .or_else(|| find_u64(data, "prompt_tokens"))
             .or(gemini_input);
@@ -427,6 +438,28 @@ mod tests {
             "thinking tokens are billed as output tokens"
         );
         assert_eq!(usage.total_tokens(), 826, "reconciles with totalTokenCount");
+    }
+
+    /// The scan path is the continuation recovery for buffers a single TLS
+    /// record could not carry — the responses most likely to be split — so it
+    /// must fold the thoughts counter exactly like the direct parse above.
+    /// It read only `candidatesTokenCount`, so a thinking model's recovered
+    /// record undercounted its output by the whole reasoning budget and broke
+    /// the same `input + output == total` identity.
+    #[test]
+    fn test_scan_partial_usage_gemini_thinking_tokens_count_as_output() {
+        let data = r#"data:{"candidates":[{"content":{"parts":[{"text":"4"}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1,"thoughtsTokenCount":815,"totalTokenCount":826,"cachedContentTokenCount":2"#;
+        let parser = TokenParser::new();
+        let usage = parser
+            .parse_data(data)
+            .expect("truncated gemini thinking usage should still parse");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(
+            usage.output_tokens, 816,
+            "the scan must fold the thoughts counter into the output like the direct parse"
+        );
+        assert_eq!(usage.total_tokens(), 826, "reconciles with totalTokenCount");
+        assert_eq!(usage.provider, LLMProvider::Gemini);
     }
 
     /// Regression guard from **real captured traffic**: Anthropic-protocol
