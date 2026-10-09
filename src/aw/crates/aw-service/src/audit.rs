@@ -85,7 +85,15 @@ impl Audit {
         {
             return Err(rejected("invalid_audit_key"));
         }
-        let metadata = fs::symlink_metadata(self.directory.join(format!("{key}.jsonl")))?;
+        // A well-formed key without a journal is an unknown handle, not a
+        // service failure; every other stat error keeps propagating as one.
+        let metadata = match fs::symlink_metadata(self.directory.join(format!("{key}.jsonl"))) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(rejected("unknown_audit_key"));
+            }
+            Err(error) => return Err(error.into()),
+        };
         if !metadata.is_file() || metadata.len() > 1024 * 1024 {
             return Err(rejected("audit_query_limit"));
         }

@@ -666,3 +666,19 @@ fn slow_active_senders_of_legal_requests_are_served() {
     assert_eq!(response["error"], Value::Null);
     assert_eq!(response["result"]["pid"], json!(std::process::id()));
 }
+
+#[test]
+fn audit_reads_distinguish_unknown_keys_from_failures() {
+    let fixture = Fixture::new();
+    let service = Running::start(&fixture, &fixture.document());
+    for (key, expected) in [
+        ("0".repeat(64), "unknown_audit_key"),
+        ("z".repeat(64), "invalid_audit_key"),
+    ] {
+        let error = service
+            .client
+            .call(Operation::Audit { key }, Instant::now() + TIMEOUT)
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
