@@ -2047,6 +2047,10 @@ fn build_case(
         .filter(|single_turn| !single_turn && attr.outcome.as_deref() == Some("fail"))
         .map(|_| "错误结论直接交付给了用户".to_string());
 
+    // Folded before the candidates are assembled, so each candidate is
+    // compared against the canonical value it must not repeat.
+    let primary_attrib = normalize_attrib(attr.attrib.as_deref());
+
     Ok(CausalCase {
         id: format!(
             "case_{}",
@@ -2072,18 +2076,16 @@ fn build_case(
         outcome: attr.outcome.clone().unwrap_or_else(|| "success".into()),
         outcome_note: attr.outcome_note.clone(),
         turn_issue: turn_issue_str,
-        attrib: normalize_attrib(attr.attrib.as_deref()),
+        attrib: primary_attrib.clone(),
         fix: attr
             .fix
             .clone()
             .filter(|f| !f.is_empty())
             .unwrap_or_else(|| "暂无建议".into()),
-        alternative_attribs: attr
-            .alternative_attribs
-            .iter()
-            .filter(|a| !a.attrib.is_empty())
-            .cloned()
-            .collect(),
+        alternative_attribs: normalize_alternative_attribs(
+            &attr.alternative_attribs,
+            &primary_attrib,
+        ),
         timeline: Some(timeline),
         nodes,
         edges,
@@ -2173,6 +2175,56 @@ fn normalize_attrib(value: Option<&str>) -> String {
         "model" | "skill" | "prompt" | "agent" => lowered,
         _ => "model".to_string(),
     }
+}
+
+/// Fold the evaluator's alternative-attribution candidates onto the contract
+/// the response itself documents: canonical categories, confidence within
+/// 0..=1, ranked by confidence descending, and free of the primary.
+///
+/// `normalize_attrib` already folds the primary's category; a candidate's
+/// `attrib` is the same class of free-form LLM value with the same variance,
+/// and the panel only masks what slipped through (`ATTRIB_STYLE[alt.attrib] ??
+/// fallback` renders a raw value with a generic style, `confidence * 100`
+/// renders 87 as "8700%") — the client-side masking the semantic-search and
+/// outcome fixes already established the server must not lean on.
+///
+/// A category outside the enum is the model's own invention and is dropped
+/// with a warning, the way hallucinated session ids are: the server holds the
+/// candidate set. Unlike the primary it needs no fallback — the candidate
+/// list is optional, an empty one is a legitimate answer. Folding happens
+/// before the primary comparison so a case variant of the primary ("Model"
+/// next to "model") is recognised as the primary again instead of surviving
+/// as a separate candidate. The sort is stable, so candidates with equal
+/// confidence keep the model's own order.
+fn normalize_alternative_attribs(
+    alternatives: &[AlternativeAttrib],
+    primary: &str,
+) -> Vec<AlternativeAttrib> {
+    let mut kept: Vec<AlternativeAttrib> = alternatives
+        .iter()
+        .filter_map(|a| {
+            let lowered = a.attrib.trim().to_ascii_lowercase();
+            if lowered.is_empty() {
+                // The same silent drop the emptiness filter always applied.
+                return None;
+            }
+            if !matches!(lowered.as_str(), "model" | "skill" | "prompt" | "agent") {
+                log::warn!(
+                    "causal-attribution: dropping alternative attrib {lowered:?} — not a canonical category"
+                );
+                return None;
+            }
+            if lowered == primary {
+                return None;
+            }
+            let mut candidate = a.clone();
+            candidate.attrib = lowered;
+            candidate.confidence = candidate.confidence.clamp(0.0, 1.0);
+            Some(candidate)
+        })
+        .collect();
+    kept.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    kept
 }
 
 #[cfg(test)]

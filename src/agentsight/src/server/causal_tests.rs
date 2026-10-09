@@ -754,3 +754,257 @@ async fn causal_attribution_rejects_unknown_id_kind() {
         assert_ne!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Alternative-attribution candidate hygiene (build_case, direct call)
+// ---------------------------------------------------------------------------
+
+/// A minimal round — one user request, one final agent message, no tool calls —
+/// so nothing feeds the grounding layer and the case comes straight from the
+/// attribution the evaluator produced.
+fn plain_round_trajectory() -> AtifTrajectory {
+    use agentsight_atif::{ATIF_SCHEMA_VERSION, Agent, StepSource};
+
+    let step = |step_id: usize, source: StepSource, message: &str| Step {
+        step_id,
+        source,
+        message: message.to_string(),
+        timestamp: None,
+        model_name: None,
+        reasoning_effort: None,
+        reasoning_content: None,
+        tool_calls: None,
+        observation: None,
+        metrics: None,
+        extra: None,
+        llm_call_count: None,
+        is_copied_context: None,
+    };
+
+    AtifTrajectory {
+        schema_version: ATIF_SCHEMA_VERSION.into(),
+        agent: Agent {
+            name: "test".into(),
+            version: "0".into(),
+            model_name: None,
+            tool_definitions: None,
+            extra: None,
+        },
+        steps: vec![
+            step(1, StepSource::User, "把甲、乙、丙三个文件移到归档目录"),
+            step(
+                2,
+                StepSource::Agent,
+                "已把甲和乙移到归档目录；丙在源目录里不存在，无法移动，请确认文件名。",
+            ),
+        ],
+        session_id: None,
+        trajectory_id: None,
+        notes: None,
+        final_metrics: None,
+        continued_trajectory_ref: None,
+        subagent_trajectories: None,
+        extra: None,
+    }
+}
+
+/// One attribution whose alternative candidates violate every clause of the
+/// documented contract: a case variant ("Model"), a category outside the enum
+/// ("environment"), a repeat of the primary ("prompt"), an out-of-range
+/// confidence (87), and a trailing low-confidence candidate.
+fn messy_alternatives() -> Attribution {
+    serde_json::from_value(serde_json::json!({
+        "outcome": "fail",
+        "outcome_note": "宣告了未完成的移动",
+        "verdict": "交付与任务不符",
+        "root_one": "未核对文件是否存在",
+        "attrib": "prompt",
+        "fix": "补约束：宣告完成前核对清单",
+        "turn_issue": false,
+        "title": "未核对就宣告完成",
+        "alternative_attribs": [
+            {"attrib": "Model", "confidence": 0.7,
+             "rationale": "也可能是模型无视证据", "fix": "c1"},
+            {"attrib": "environment", "confidence": 0.95,
+             "rationale": "环境问题也说得通", "fix": "c2"},
+            {"attrib": "prompt", "confidence": 0.9,
+             "rationale": "指令没锁对象", "fix": "c3"},
+            {"attrib": "agent", "confidence": 87.0,
+             "rationale": "编排缺校验关卡", "fix": "c4"},
+            {"attrib": "skill", "confidence": 0.3,
+             "rationale": "工具返回缺字段", "fix": "c5"}
+        ]
+    }))
+    .expect("attribution fixture parses")
+}
+
+/// The candidates' contract is documented four ways — the struct doc
+/// ("Other candidates … sorted by confidence desc. Excludes the primary"),
+/// the `CausalCase` field doc ("ranked by confidence"), the prompt ("按
+/// confidence 从高到低排序", "confidence: 0..1 的浮点数", "attrib 与 primary
+/// 不同"), and the dashboard's `CausalAttrib` enum with "0..1" confidence —
+/// yet `build_case` passed the evaluator's array through with only an
+/// emptiness filter, while the primary `attrib` right beside it goes through
+/// `normalize_attrib`. The panel masks what it can (`ATTRIB_STYLE[alt.attrib]
+/// ?? fallback` renders a raw value with a generic style, `confidence * 100`
+/// renders 87 as "8700%"), which is the client-side masking the
+/// semantic-search and outcome fixes already established the server must not
+/// rely on.
+#[test]
+fn alternative_candidates_are_folded_clamped_ranked_and_primary_free() {
+    let doc = plain_round_trajectory();
+    let req = CausalRequest {
+        session_id: "s".into(),
+        round_index: None,
+        complaint: "文件没有全部移过去".into(),
+        force: true,
+        id_kind: None,
+    };
+
+    let mut case_ = build_case(
+        &doc,
+        &doc.steps,
+        &req,
+        &Verdicts::default(),
+        &messy_alternatives(),
+        &empty_index(),
+    )
+    .expect("case builds from a well-formed trajectory");
+    gate_by_evidence(&mut case_, &empty_index());
+
+    let alts = &case_.alternative_attribs;
+    assert_eq!(
+        alts.len(),
+        3,
+        "only canonical, primary-free candidates may survive: got {alts:?}"
+    );
+    assert!(
+        alts.iter()
+            .all(|a| matches!(a.attrib.as_str(), "model" | "skill" | "prompt" | "agent")),
+        "every surviving candidate must carry a canonical category, got {alts:?}"
+    );
+    assert!(
+        alts.iter().all(|a| (0.0..=1.0).contains(&a.confidence)),
+        "confidence is documented 0..1 and renders as a percentage, got {alts:?}"
+    );
+    assert_eq!(alts[0].attrib, "agent");
+    assert_eq!(
+        alts[0].confidence, 1.0,
+        "an out-of-range 87 must clamp to the documented ceiling"
+    );
+    assert_eq!(
+        alts[1].attrib, "model",
+        "the case variant \"Model\" must fold onto the canonical value"
+    );
+    assert_eq!(alts[1].confidence, 0.7);
+    assert_eq!(alts[2].attrib, "skill");
+    assert_eq!(alts[2].confidence, 0.3);
+}
+
+/// The guard: a fully compliant candidate list — canonical categories, in-range
+/// confidences, already ranked, none repeating the primary — must pass through
+/// untouched, with the model's own order among equal confidences preserved
+/// (stable sort, arrival order as the tie-break).
+#[test]
+fn compliant_alternative_candidates_survive_unchanged() {
+    let attr: Attribution = serde_json::from_value(serde_json::json!({
+        "outcome": "fail",
+        "verdict": "交付与任务不符",
+        "root_one": "未核对文件是否存在",
+        "attrib": "prompt",
+        "fix": "补约束：宣告完成前核对清单",
+        "turn_issue": false,
+        "alternative_attribs": [
+            {"attrib": "model", "confidence": 0.8,
+             "rationale": "模型无视证据", "fix": "g1"},
+            {"attrib": "agent", "confidence": 0.5,
+             "rationale": "编排缺校验", "fix": "g2"},
+            {"attrib": "skill", "confidence": 0.5,
+             "rationale": "静默失败", "fix": "g3"}
+        ]
+    }))
+    .expect("attribution fixture parses");
+
+    let doc = plain_round_trajectory();
+    let req = CausalRequest {
+        session_id: "s".into(),
+        round_index: None,
+        complaint: "文件没有全部移过去".into(),
+        force: true,
+        id_kind: None,
+    };
+
+    let mut case_ = build_case(
+        &doc,
+        &doc.steps,
+        &req,
+        &Verdicts::default(),
+        &attr,
+        &empty_index(),
+    )
+    .expect("case builds from a well-formed trajectory");
+    gate_by_evidence(&mut case_, &empty_index());
+
+    let alts = &case_.alternative_attribs;
+    assert_eq!(
+        alts.len(),
+        3,
+        "a compliant list must not lose candidates, got {alts:?}"
+    );
+    let rendered: Vec<(&str, f32)> = alts
+        .iter()
+        .map(|a| (a.attrib.as_str(), a.confidence))
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![("model", 0.8), ("agent", 0.5), ("skill", 0.5)],
+        "values, ranking, and the model's tie order must be preserved"
+    );
+}
+
+/// A candidate that repeats the primary's category through a case variant
+/// ("Model" next to a primary "model") is the primary in disguise: on main it
+/// survives the emptiness filter and the panel offers the primary's own
+/// perspective twice, while the doc says candidates exclude the primary.
+#[test]
+fn a_case_variant_of_the_primary_is_not_re_offered_as_a_candidate() {
+    let attr: Attribution = serde_json::from_value(serde_json::json!({
+        "outcome": "fail",
+        "verdict": "交付与任务不符",
+        "root_one": "未核对文件是否存在",
+        "attrib": "model",
+        "fix": "下结论前强制引用证据",
+        "turn_issue": false,
+        "alternative_attribs": [
+            {"attrib": "Model", "confidence": 0.6,
+             "rationale": "模型问题", "fix": "h1"}
+        ]
+    }))
+    .expect("attribution fixture parses");
+
+    let doc = plain_round_trajectory();
+    let req = CausalRequest {
+        session_id: "s".into(),
+        round_index: None,
+        complaint: "文件没有全部移过去".into(),
+        force: true,
+        id_kind: None,
+    };
+
+    let mut case_ = build_case(
+        &doc,
+        &doc.steps,
+        &req,
+        &Verdicts::default(),
+        &attr,
+        &empty_index(),
+    )
+    .expect("case builds from a well-formed trajectory");
+    gate_by_evidence(&mut case_, &empty_index());
+
+    assert!(
+        case_.alternative_attribs.is_empty(),
+        "a candidate folding onto the primary's category is the primary again, not an alternative: got {:?}",
+        case_.alternative_attribs
+    );
+}
