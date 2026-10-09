@@ -7305,7 +7305,12 @@ fn eval_bpf_jit_enable(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usi
 }
 
 fn eval_bpf_jit_harden(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    eval_bpf_jit_harden_at("/proc/sys/net/core/bpf_jit_harden", recs)
+    eval_bpf_jit_harden_at(
+        "/proc/sys/net/core/bpf_jit_harden",
+        "/proc/sys/net/core/bpf_jit_enable",
+        "/proc/sys/kernel/unprivileged_bpf_disabled",
+        recs,
+    )
 }
 
 /// Path-injectable form (the `eval_*_at` idiom) so the unreadable branch is
@@ -7319,8 +7324,35 @@ fn eval_bpf_jit_harden(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> us
 /// 加固未启用" for a host whose value was never read, and the same run marks
 /// the parameter `"writable": false`. `why` already refuses to present a
 /// failed read as a value ("A failed read is an error, never a value"); the
-/// rule must not invent one either. A readable 0 is still a finding.
-fn eval_bpf_jit_harden_at(path: &str, recs: &mut Vec<Recommendation>) -> usize {
+/// rule must not invent one either. A readable 0 is still a finding - but only
+/// where the kernel has a consumer for the write. The blinding this advice
+/// asks for runs inside the arch JIT compilers (`bpf_jit_blind_constants`,
+/// arch/x86/net/bpf_jit_comp.c:2715 in v6.6), and `bpf_jit_blinding_enabled()`
+/// (include/linux/filter.h, v6.6 and master) bails out unless the program asked
+/// for the JIT at all - `jit_requested` is `ebpf_jit_enabled()`, so a
+/// `net.core.bpf_jit_enable` of 0 means the interpreter runs and no JIT code
+/// exists to blind - and unless the loader is unprivileged, because level 1
+/// never blinds a `bpf_capable()` loader's program (`bpf_jit_harden == 1 &&
+/// bpf_capable()` bails out; master's `bpf_token_capable()` reads the same).
+/// With `kernel.unprivileged_bpf_disabled` at 1 or 2 the bpf() syscall gates
+/// have already returned -EPERM for every loader without CAP_BPF
+/// (kernel/bpf/syscall.c, `map_create()` and `bpf_prog_load()`), so every
+/// program that can still be loaded belongs to a capable loader and the
+/// level-1 write blinds nothing. Staying quiet there is the "never recommend
+/// a no-op" rule the hardlockup_panic and watchdog_thresh gates follow.
+///
+/// A missing or unreadable switch keeps the recommendation: `bpf_jit_enable`
+/// is registered beside `bpf_jit_harden` behind the same CONFIG_BPF_JIT
+/// (net/core/sysctl_net_core.c) and `unprivileged_bpf_disabled` behind
+/// CONFIG_BPF_SYSCALL, so only a synthetic path can be absent - the same
+/// fail-open rule the core_uses_pid and hardlockup_panic gates follow. Only
+/// a value the reader actually produced counts as the switch being off.
+fn eval_bpf_jit_harden_at(
+    path: &str,
+    jit_enable_path: &str,
+    unprivileged_bpf_path: &str,
+    recs: &mut Vec<Recommendation>,
+) -> usize {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return 1;
     };
@@ -7328,6 +7360,24 @@ fn eval_bpf_jit_harden_at(path: &str, recs: &mut Vec<Recommendation>) -> usize {
         return 1;
     };
     if current == 0 {
+        // No JIT, no JIT-compiled code to blind.
+        let jit_disabled = std::fs::read_to_string(jit_enable_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            == Some(0);
+        if jit_disabled {
+            return 1;
+        }
+        // Level 1 never blinds a bpf_capable() loader's programs, and with
+        // unprivileged BPF denied (1 or 2) every loader that passed the
+        // bpf() gate is bpf_capable().
+        let unprivileged_bpf_denied = std::fs::read_to_string(unprivileged_bpf_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .is_some_and(|value| value != 0);
+        if unprivileged_bpf_denied {
+            return 1;
+        }
         recs.push(Recommendation {
             param: "net.core.bpf_jit_harden".to_string(),
             current_value: "0".to_string(),
@@ -13075,7 +13125,20 @@ mod tests {
         // read_sysctl_u64 maps the failure to 0 and cannot tell them apart.
         match std::fs::read_to_string("/proc/sys/net/core/bpf_jit_harden") {
             Ok(raw) => {
-                assert_eq!(triggered, raw.trim() == "0", "readable value {raw:?}");
+                // The sibling switches decide whether a readable 0 is a
+                // finding: with the JIT off, or unprivileged BPF already
+                // denied, the kernel has no consumer for the write.
+                let jit_disabled = std::fs::read_to_string("/proc/sys/net/core/bpf_jit_enable")
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    == Some(0);
+                let unprivileged_bpf_denied =
+                    std::fs::read_to_string("/proc/sys/kernel/unprivileged_bpf_disabled")
+                        .ok()
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                        .is_some_and(|value| value != 0);
+                let expect = raw.trim() == "0" && !jit_disabled && !unprivileged_bpf_denied;
+                assert_eq!(triggered, expect, "readable value {raw:?}");
                 if triggered {
                     assert_eq!(recs.last().unwrap().category, Category::Security);
                 }
@@ -13092,7 +13155,7 @@ mod tests {
         // A directory is the portable stand-in for "exists but cannot be
         // read" (EISDIR), which works for root and unprivileged runs alike.
         let mut recs = Vec::new();
-        assert_eq!(eval_bpf_jit_harden_at("/", &mut recs), 1);
+        assert_eq!(eval_bpf_jit_harden_at("/", "/", "/", &mut recs), 1);
         assert!(
             recs.is_empty(),
             "a failed read must not report a hardening gap: {recs:?}"
@@ -13105,10 +13168,18 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("bpf_jit_harden");
         let path = path.to_str().expect("utf-8 temp path");
+        // Missing switch files keep the recommendation (fail-open).
+        let jit_missing = dir.join("bpf_jit_enable.missing");
+        let unpriv_missing = dir.join("unprivileged_bpf_disabled.missing");
 
         std::fs::write(path, "0\n").expect("write fixture");
         let mut recs = Vec::new();
-        eval_bpf_jit_harden_at(path, &mut recs);
+        eval_bpf_jit_harden_at(
+            path,
+            jit_missing.to_str().expect("utf-8 temp path"),
+            unpriv_missing.to_str().expect("utf-8 temp path"),
+            &mut recs,
+        );
         assert_eq!(recs.len(), 1, "a readable 0 is still a finding");
         assert_eq!(recs[0].param, "net.core.bpf_jit_harden");
         assert_eq!(recs[0].current_value, "0");
@@ -13116,16 +13187,113 @@ mod tests {
 
         std::fs::write(path, "1\n").expect("write fixture");
         let mut recs = Vec::new();
-        eval_bpf_jit_harden_at(path, &mut recs);
+        eval_bpf_jit_harden_at(
+            path,
+            jit_missing.to_str().expect("utf-8 temp path"),
+            unpriv_missing.to_str().expect("utf-8 temp path"),
+            &mut recs,
+        );
         assert!(recs.is_empty(), "a hardened host has no finding");
 
         // Garbage is a failed parse, not a value either.
         std::fs::write(path, "not-a-number\n").expect("write fixture");
         let mut recs = Vec::new();
-        eval_bpf_jit_harden_at(path, &mut recs);
+        eval_bpf_jit_harden_at(
+            path,
+            jit_missing.to_str().expect("utf-8 temp path"),
+            unpriv_missing.to_str().expect("utf-8 temp path"),
+            &mut recs,
+        );
         assert!(recs.is_empty(), "unparseable content is not the value 0");
         std::fs::remove_file(path).ok();
         std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn bpf_jit_harden_needs_the_jit_and_unprivileged_loaders() {
+        // The blinding this advice asks for only runs inside the arch JIT
+        // compilers, and bpf_jit_blinding_enabled() (include/linux/filter.h,
+        // v6.6 and master) bails out unless the program asked for the JIT at
+        // all (`jit_requested` is `ebpf_jit_enabled()`, so a bpf_jit_enable of
+        // 0 means the interpreter runs and there is no JIT code to blind) and
+        // unless the loader is unprivileged (level 1 never blinds a
+        // bpf_capable() loader's program). With unprivileged_bpf_disabled at
+        // 1 or 2 the bpf() gates (kernel/bpf/syscall.c, map_create() and
+        // bpf_prog_load()) already returned -EPERM for every loader without
+        // CAP_BPF, so a level-1 write blinds nothing there either.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner-bpf-harden-gates-{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let harden = dir.join("bpf_jit_harden");
+        std::fs::write(&harden, "0\n").expect("write fixture");
+        let jit_on = dir.join("bpf_jit_enable.on");
+        std::fs::write(&jit_on, "1\n").expect("write fixture");
+        let jit_off = dir.join("bpf_jit_enable.off");
+        std::fs::write(&jit_off, "0\n").expect("write fixture");
+        let jit_missing = dir.join("bpf_jit_enable.missing");
+        let unpriv_open = dir.join("unprivileged_bpf_disabled.open");
+        std::fs::write(&unpriv_open, "0\n").expect("write fixture");
+        let unpriv_denied_1 = dir.join("unprivileged_bpf_disabled.one");
+        std::fs::write(&unpriv_denied_1, "1\n").expect("write fixture");
+        let unpriv_denied_2 = dir.join("unprivileged_bpf_disabled.two");
+        std::fs::write(&unpriv_denied_2, "2\n").expect("write fixture");
+        let unpriv_missing = dir.join("unprivileged_bpf_disabled.missing");
+
+        // A disabled JIT never compiles the program: nothing to blind.
+        let mut recs = Vec::new();
+        eval_bpf_jit_harden_at(
+            harden.to_str().expect("utf-8 temp path"),
+            jit_off.to_str().expect("utf-8 temp path"),
+            unpriv_open.to_str().expect("utf-8 temp path"),
+            &mut recs,
+        );
+        assert!(
+            recs.is_empty(),
+            "bpf_jit_enable 0 runs the interpreter: there is no JIT code to blind"
+        );
+
+        // Level 1 only blinds programs an unprivileged loader submitted.
+        for unpriv in [&unpriv_denied_1, &unpriv_denied_2] {
+            let mut recs = Vec::new();
+            eval_bpf_jit_harden_at(
+                harden.to_str().expect("utf-8 temp path"),
+                jit_on.to_str().expect("utf-8 temp path"),
+                unpriv.to_str().expect("utf-8 temp path"),
+                &mut recs,
+            );
+            assert!(
+                recs.is_empty(),
+                "{}: only bpf_capable() loaders can reach bpf(), and level 1 never blinds their programs",
+                unpriv.display()
+            );
+        }
+
+        // A live JIT with loadable unprivileged programs keeps the advice,
+        // and so does every missing or unreadable switch (fail-open).
+        for (jit, unpriv) in [
+            (&jit_on, &unpriv_open),
+            (&jit_missing, &unpriv_open),
+            (&jit_on, &unpriv_missing),
+        ] {
+            let mut recs = Vec::new();
+            eval_bpf_jit_harden_at(
+                harden.to_str().expect("utf-8 temp path"),
+                jit.to_str().expect("utf-8 temp path"),
+                unpriv.to_str().expect("utf-8 temp path"),
+                &mut recs,
+            );
+            assert!(
+                recs.iter().any(|r| r.param == "net.core.bpf_jit_harden"),
+                "jit {} / unpriv {}: the hardening advice must stay",
+                jit.display(),
+                unpriv.display()
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
