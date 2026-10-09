@@ -954,10 +954,12 @@ impl GenAIBuilder {
         let mut added_indexes: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut orphan_done: Vec<(String, String, String)> = Vec::new();
         // Set by the terminal `response.incomplete` event when the stream was
-        // cut by the output cap, mirroring `aggregate_responses_sse_chunks`;
-        // `response.completed` sets `completed` for the finish fallback below.
+        // cut by the output cap or the provider's safety policy, mirroring
+        // `aggregate_responses_sse_chunks`; `response.completed` sets
+        // `completed` for the finish fallback below.
         let mut completed = false;
         let mut output_capped = false;
+        let mut output_filtered = false;
 
         for chunk in chunks {
             calls.observe(chunk);
@@ -1062,16 +1064,22 @@ impl GenAIBuilder {
                 // A capped stream terminates with response.incomplete instead
                 // of response.completed; the cap reason must surface as the
                 // chat-completions "length" finish rather than a clean "stop".
+                // A safety cut reports reason "content_filter" and maps to the
+                // same spelling both live paths use — the interruption
+                // detector's SafetyFilter rule keys on it, so the drained row
+                // must not report a clean stop either.
                 "response.incomplete" => {
                     saw_responses_event = true;
                     if let Some(resp) = chunk.get("response") {
-                        if resp.get("status").and_then(|v| v.as_str()) == Some("incomplete")
-                            && resp
+                        if resp.get("status").and_then(|v| v.as_str()) == Some("incomplete") {
+                            match resp
                                 .pointer("/incomplete_details/reason")
                                 .and_then(|v| v.as_str())
-                                == Some("max_output_tokens")
-                        {
-                            output_capped = true;
+                            {
+                                Some("max_output_tokens") => output_capped = true,
+                                Some("content_filter") => output_filtered = true,
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -1130,13 +1138,15 @@ impl GenAIBuilder {
 
         // Same finish-reason convention as the analyzer's aggregator: the
         // terminal event decides. A capped stream is the chat "length"
-        // finish — the cap wins even when a tool call was in flight, because
-        // its arguments may be cut mid-JSON — and a stream whose capture
-        // never saw a terminal event at all keeps an unknown finish instead
-        // of a fabricated clean stop, the same None the Anthropic merger
-        // leaves on a missing message_delta.
+        // finish — the cap or the safety cut wins even when a tool call was
+        // in flight, because its arguments may be cut mid-JSON — and a stream
+        // whose capture never saw a terminal event at all keeps an unknown
+        // finish instead of a fabricated clean stop, the same None the
+        // Anthropic merger leaves on a missing message_delta.
         let finish_reason = if output_capped {
             Some("length".to_string())
+        } else if output_filtered {
+            Some("content_filter".to_string())
         } else if !completed {
             None
         } else if parts
@@ -2000,6 +2010,34 @@ mod tests {
             other => panic!("expected ToolCall part, got {other:?}"),
         }
         assert!(finish.is_none(), "no terminal event means no finish reason");
+    }
+
+    /// A stream the provider's safety policy cut short terminates with
+    /// `response.incomplete` and `incomplete_details.reason =
+    /// "content_filter"`. Both live paths map that to the chat-completions
+    /// "content_filter" (the interruption detector's SafetyFilter rule keys on
+    /// exactly that spelling), but the drain merger recognised only
+    /// `max_output_tokens`, so the same policy cut surfaced on a completed
+    /// stream and vanished — recorded as a clean "stop" — when the capture was
+    /// drained.
+    #[test]
+    fn test_responses_sse_incomplete_content_filter_is_content_filter() {
+        let body = r#"[
+            {"type":"response.created","response":{"id":"resp_3","model":"gpt-5"}},
+            {"type":"response.output_text.delta","delta":"partial"},
+            {"type":"response.incomplete","response":{"id":"resp_3","status":"incomplete","incomplete_details":{"reason":"content_filter"},"usage":{"input_tokens":100,"output_tokens":4,"total_tokens":104}}}
+        ]"#;
+        let (parts, finish) = GenAIBuilder::extract_parts_from_sse_body(body).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Text { content } if content == "partial"
+        ));
+        assert_eq!(
+            finish.as_deref(),
+            Some("content_filter"),
+            "a safety cut must surface as content_filter, not a clean stop"
+        );
     }
 
     #[test]
