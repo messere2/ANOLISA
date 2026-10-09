@@ -633,18 +633,34 @@ impl GenAIBuilder {
                     }
                 }
                 // Refusal: OpenAI's safety refusal arrives in its own delta
-                // field, with no content delta alongside it.
+                // field, with no content delta alongside it. A snapshot
+                // repeats the refusal so far, so it accumulates like the
+                // other snapshot fields instead of appending per frame.
                 if let Some(r) = delta.get("refusal").and_then(|v| v.as_str()) {
-                    refusal_buf.push_str(r);
+                    if cumulative {
+                        accumulate_text(&mut refusal_buf, r);
+                    } else {
+                        refusal_buf.push_str(r);
+                    }
                 }
                 // Tool call deltas — merge by index. A snapshot's calls are
-                // whole, not fragments, so they are left to the typed parsers
-                // that understand their provider shape rather than being
-                // appended into the delta accumulator frame after frame.
-                if let (false, Some(calls)) = (
-                    cumulative,
-                    delta.get("tool_calls").and_then(|v| v.as_array()),
-                ) {
+                // whole, not fragments, and repeat with every snapshot — in
+                // the OpenAI `tool_calls` spelling or SysOM's `tool_use` —
+                // so the last value per index wins instead of the calls
+                // being appended frame after frame or dropped wholesale
+                // (there is no typed parser behind this merger for the
+                // plain choices shape: a pure-snapshot tool stream folded
+                // to no parts at all and lost the whole output).
+                let calls = delta
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .or_else(|| {
+                        cumulative
+                            .then(|| delta.get("tool_use"))
+                            .flatten()
+                            .and_then(|v| v.as_array())
+                    });
+                if let Some(calls) = calls {
                     for tc in calls {
                         // `index` comes off the wire. A value outside the slot
                         // range must not be truncated into another slot, which
@@ -677,7 +693,18 @@ impl GenAIBuilder {
                                 // name:"" on every continuation delta.
                             }
                             if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
-                                entry.2.push_str(args);
+                                if cumulative {
+                                    // A snapshot's arguments are whole: the
+                                    // last snapshot carrying them holds the
+                                    // complete call, replacing whatever
+                                    // fragments or earlier snapshots
+                                    // accumulated.
+                                    if !args.is_empty() {
+                                        entry.2 = args.to_string();
+                                    }
+                                } else {
+                                    entry.2.push_str(args);
+                                }
                             }
                         }
                     }
@@ -2145,6 +2172,84 @@ mod tests {
             matches!(&parts[0], MessagePart::Text { content } if content == "Done"),
             "{parts:?}"
         );
+    }
+
+    /// A cumulative `message` snapshot repeats the refusal so far; it must
+    /// accumulate, not append per frame (content and reasoning already do).
+    #[test]
+    fn test_merge_sse_chunks_snapshot_refusal_accumulates() {
+        let body = r#"[
+            {"choices":[{"message":{"refusal":"I can't"}}]},
+            {"choices":[{"message":{"refusal":"I can't help with that."},"finish_reason":"stop"}]}
+        ]"#;
+        let (parts, finish) = GenAIBuilder::extract_parts_from_sse_body(body).unwrap();
+        assert_eq!(finish, Some("stop".to_string()));
+        assert_eq!(parts.len(), 1);
+        assert!(
+            matches!(&parts[0], MessagePart::Text { content } if content == "I can't help with that."),
+            "{parts:?}"
+        );
+    }
+
+    /// A pure-snapshot tool-calling stream (an OpenAI-compatible gateway
+    /// whose whole-message frames carry `tool_calls`) kept no parts at all:
+    /// the merger dropped the snapshot calls, the native fallback needs the
+    /// `output` envelope, and the entire output vanished.
+    #[test]
+    fn test_merge_sse_chunks_reads_snapshot_tool_calls() {
+        let body = r#"[
+            {"choices":[{"message":{"content":"","tool_calls":[
+                {"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]},
+            {"choices":[{"message":{"content":"","tool_calls":[
+                {"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\": \"Beijing\"}"}}]},
+                "finish_reason":"tool_calls"}]}
+        ]"#;
+        let (parts, finish) = GenAIBuilder::extract_parts_from_sse_body(body).unwrap();
+        assert_eq!(finish, Some("tool_calls".to_string()));
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            MessagePart::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id.as_deref(), Some("call_1"));
+                assert_eq!(name, "get_weather");
+                assert_eq!(arguments.as_ref().unwrap()["city"], "Beijing");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    /// SysOM's Copilot stream is the same shape with its own `tool_use`
+    /// spelling; the live path deep-parses it, but the drain merger is the
+    /// only parser a dead-pid SysOM call gets — without this arm its tool
+    /// calls (and the tool pairing derived from them) were lost while the
+    /// text survived.
+    #[test]
+    fn test_merge_sse_chunks_reads_sysom_tool_use_snapshots() {
+        let body = r#"[
+            {"choices":[{"message":{"content":"","tool_use":[
+                {"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}}]},
+            {"choices":[{"message":{"content":"","tool_use":[
+                {"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\": \"Beijing\"}"}}]},
+                "finish_reason":"tool_calls"}]}
+        ]"#;
+        let (parts, finish) = GenAIBuilder::extract_parts_from_sse_body(body).unwrap();
+        assert_eq!(finish, Some("tool_calls".to_string()));
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            MessagePart::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id.as_deref(), Some("call_1"));
+                assert_eq!(name, "get_weather");
+                assert_eq!(arguments.as_ref().unwrap()["city"], "Beijing");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
     }
 
     /// A choice that carries neither member still reports its finish reason
