@@ -52,13 +52,12 @@ const ID_CHUNK: usize = 500;
 ///
 /// Both streams live in the daemon's data directory, so the observability
 /// system store is the `observability.db` beside the security-events database
-/// the operator named — the same rule the daemon's own resolution produces.
+/// the operator named — the same rule the daemon's own resolution produces,
+/// and the one [`asc_observability::config::observability_db_beside`] now
+/// owns for every caller.
 #[must_use]
 pub fn destination_for(security_destination: &Path) -> PathBuf {
-    security_destination
-        .parent()
-        .unwrap_or(security_destination)
-        .join("observability.db")
+    asc_observability::config::observability_db_beside(security_destination)
 }
 
 /// Opens the observability system store and forces schema convergence.

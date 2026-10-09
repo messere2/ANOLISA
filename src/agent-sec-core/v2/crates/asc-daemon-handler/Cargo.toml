@@ -22,6 +22,7 @@ asc-security-events = { workspace = true }
 asc-sqlite-kernel = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
@@ -32,6 +33,8 @@ asc-capability-prompt-scan.workspace = true
 asc-action-runtime = { workspace = true, features = ["testing"] }
 
 tempfile = { workspace = true }
+rusqlite = { workspace = true }
+rustix = { workspace = true }
 asc-pap = { workspace = true }
 asc-pap-repository-memory = { workspace = true }
 asc-policy-engine = { workspace = true }

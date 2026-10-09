@@ -6,12 +6,17 @@
 pub mod policy;
 pub mod reader;
 pub mod repository;
+pub mod system_reader;
+pub mod system_repository;
 pub mod table;
 pub mod writer;
 
 pub use policy::ObservabilityFaultPolicy;
 pub use reader::ObservabilityReader;
 pub use repository::ObservabilityEventRepository;
+pub use repository::{EpochWindow, ObservabilityEventRow, Page};
+pub use system_reader::SystemObservabilityReader;
+pub use system_repository::SystemObservabilityRepository;
 pub use table::{
     OBSERVABILITY_TABLES, SYSTEM_OBSERVABILITY_SQLITE_SCHEMA_VERSION, SYSTEM_OBSERVABILITY_TABLES,
 };

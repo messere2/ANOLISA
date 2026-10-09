@@ -403,7 +403,7 @@ fn time_bounds(params: &SecQueryParams) -> Result<(Option<f64>, Option<f64>), ()
 /// is at most `u64::MAX / 1e9 < 2^34` and the remainder is below `1e9`, both
 /// far inside `f64`'s 53-bit mantissa.
 #[allow(clippy::cast_precision_loss)]
-fn epoch_of_nanos(nanos: u64) -> f64 {
+pub(crate) fn epoch_of_nanos(nanos: u64) -> f64 {
     let seconds = nanos / 1_000_000_000;
     let remainder = nanos % 1_000_000_000;
     seconds as f64 + remainder as f64 / 1e9
@@ -413,13 +413,18 @@ fn epoch_of_nanos(nanos: u64) -> f64 {
 ///
 /// Both failure shapes — an unparsable value and a missing timezone — are the
 /// caller's fault and land as the same `invalid_argument` rejection.
-fn iso_to_epoch(raw: &str, field: &str) -> Result<f64, ()> {
+pub(crate) fn iso_to_epoch(raw: &str, field: &str) -> Result<f64, ()> {
     let normalized = normalize_iso_to_utc_iso(raw, field, NaivePolicy::Local).map_err(|_| ())?;
     utc_iso_to_epoch(&normalized, field).map_err(|_| ())
 }
 
 /// Validates one optional positive-integer parameter against v1's bounds.
-fn bounded(value: Option<u64>, default: u64, minimum: u64, maximum: u64) -> Result<u64, ()> {
+pub(crate) fn bounded(
+    value: Option<u64>,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, ()> {
     let value = value.unwrap_or(default);
     if value < minimum || value > maximum {
         return Err(());
@@ -428,12 +433,12 @@ fn bounded(value: Option<u64>, default: u64, minimum: u64, maximum: u64) -> Resu
 }
 
 /// Trims one optional string the way v1's `_optional_string_param` did.
-fn non_empty(value: Option<&str>) -> Option<&str> {
+pub(crate) fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 /// Computes v1's `next_offset` pagination cursor.
-fn next_offset(offset: u32, limit: u64, returned: u64, total: u64) -> Option<u64> {
+pub(crate) fn next_offset(offset: u32, limit: u64, returned: u64, total: u64) -> Option<u64> {
     let offset = u64::from(offset);
     if offset + returned < total {
         Some(offset + limit)
@@ -447,7 +452,7 @@ fn next_offset(offset: u32, limit: u64, returned: u64, total: u64) -> Option<u64
 /// The base object is the event's own serialization, which reproduces v1
 /// `to_dict()` field for field; the dashboard adds the derived `verdict` and
 /// the `skill_ledger` projection, and drops `details` unless asked to keep it.
-fn event_payload(event: &SecurityEvent, include_details: bool) -> Value {
+pub(crate) fn event_payload(event: &SecurityEvent, include_details: bool) -> Value {
     let mut payload = serde_json::to_value(event).expect("the event serializes");
     let Some(object) = payload.as_object_mut() else {
         return payload;
@@ -540,7 +545,7 @@ fn count_items(groups: &GroupCounts) -> Vec<Value> {
     items
 }
 
-fn invalid_parameters(request_id: RequestId) -> DaemonResponse {
+pub(crate) fn invalid_parameters(request_id: RequestId) -> DaemonResponse {
     DaemonResponse::error(
         request_id,
         error_code::INVALID_ARGUMENT,
@@ -548,7 +553,7 @@ fn invalid_parameters(request_id: RequestId) -> DaemonResponse {
     )
 }
 
-fn bounded_message(message: &str) -> String {
+pub(crate) fn bounded_message(message: &str) -> String {
     if message.len() > MAX_DAEMON_ERROR_MESSAGE_BYTES {
         "request parameters are invalid".to_owned()
     } else {

@@ -59,6 +59,13 @@ pub const SEC_EVENTS_GET: &str = "sec.events.get";
 /// Count the caller's own security events grouped by one field.
 pub const SEC_EVENTS_COUNT_BY: &str = "sec.events.count_by";
 
+/// List the caller's own observability sessions, most recent first.
+pub const OBS_SESSIONS_LIST: &str = "obs.sessions.list";
+/// List the caller's own runs of one observability session.
+pub const OBS_RUNS_LIST: &str = "obs.runs.list";
+/// Return one of the caller's own run timelines with correlated security events.
+pub const OBS_TIMELINE_GET: &str = "obs.timeline.get";
+
 /// Complete PAP method inventory for this protocol version.
 pub const PAP_METHODS: [&str; 15] = [
     POLICY_TEMPLATES_CREATE,
@@ -87,18 +94,22 @@ pub const ACTION_METHODS: [&str; 5] = [
     ACTION_SKILL_SEC,
 ];
 
-/// Complete read-only query method inventory for this protocol version.
-///
-/// The v1 observability query methods (`obs.sessions.list`, `obs.runs.list`,
-/// `obs.timeline.get`) stay outside this inventory until the observability
-/// stream carries an owner column, because exposing them without one would
-/// turn the system daemon into a cross-UID reader (issue #6608).
+/// Complete read-only security-event query inventory for this protocol version.
 pub const QUERY_METHODS: [&str; 4] = [
     SEC_SUMMARY,
     SEC_EVENTS_LIST,
     SEC_EVENTS_GET,
     SEC_EVENTS_COUNT_BY,
 ];
+
+/// Complete read-only observability query inventory for this protocol version.
+///
+/// These v1 methods were held back while the observability stream had no
+/// owner column: serving them from the shared system store would have made
+/// the daemon a cross-UID reader. The system store now converges a verified
+/// `owner` onto every row (#6605), so the methods return with the same
+/// row-level scoping the `sec.*` family carries (issue #6608).
+pub const OBS_METHODS: [&str; 3] = [OBS_SESSIONS_LIST, OBS_RUNS_LIST, OBS_TIMELINE_GET];
 
 /// One Policy operation resolved from its exact wire method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +195,17 @@ pub enum QueryMethod {
     EventsCountBy,
 }
 
+/// One read-only observability query resolved from its exact wire method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObsQueryMethod {
+    /// The caller's sessions, most recent activity first.
+    SessionsList,
+    /// The caller's runs of one session, chronological.
+    RunsList,
+    /// One run's timeline with correlated security events.
+    TimelineGet,
+}
+
 /// Closed daemon method identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodId {
@@ -191,8 +213,10 @@ pub enum MethodId {
     Pap(PapMethod),
     /// Action capability method.
     Action(ActionMethod),
-    /// Read-only owner-scoped query method.
+    /// Read-only owner-scoped security-event query method.
     Query(QueryMethod),
+    /// Read-only owner-scoped observability query method.
+    ObsQuery(ObsQueryMethod),
 }
 
 /// Server-owned access policy for a method.
@@ -224,11 +248,11 @@ impl MethodId {
                 access: AccessPolicy::PolicyAdministrator,
             },
             // Action capabilities and read-only queries share one access
-            // policy: any kernel-authenticated local peer. The query family
-            // adds row-level owner scoping inside its handler, derived from
-            // the transport-authenticated principal rather than from the
-            // request.
-            Self::Action(_) | Self::Query(_) => Metadata {
+            // policy: any kernel-authenticated local peer. Both query
+            // families add row-level owner scoping inside their handlers,
+            // derived from the transport-authenticated principal rather than
+            // from the request.
+            Self::Action(_) | Self::Query(_) | Self::ObsQuery(_) => Metadata {
                 access: AccessPolicy::LocalUser,
             },
         }
@@ -262,6 +286,9 @@ pub fn resolve(method: &str) -> Option<MethodId> {
         SEC_EVENTS_LIST => Some(MethodId::Query(QueryMethod::EventsList)),
         SEC_EVENTS_GET => Some(MethodId::Query(QueryMethod::EventsGet)),
         SEC_EVENTS_COUNT_BY => Some(MethodId::Query(QueryMethod::EventsCountBy)),
+        OBS_SESSIONS_LIST => Some(MethodId::ObsQuery(ObsQueryMethod::SessionsList)),
+        OBS_RUNS_LIST => Some(MethodId::ObsQuery(ObsQueryMethod::RunsList)),
+        OBS_TIMELINE_GET => Some(MethodId::ObsQuery(ObsQueryMethod::TimelineGet)),
         _ => None,
     }
 }

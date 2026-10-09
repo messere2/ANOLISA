@@ -61,6 +61,23 @@ pub fn observability_db_path_in(data_dir: &Path) -> Result<PathBuf, ConfigError>
     stream_db_path_in(data_dir, OBSERVABILITY_STREAM)
 }
 
+/// Returns the observability database that shares a security-events database's
+/// directory.
+///
+/// Both streams live in the same data directory, so callers that already hold
+/// the security-events database path — the daemon's composition root, the
+/// state migrator — derive the observability sibling from it instead of
+/// resolving the data directory twice. The rule is the one
+/// [`observability_db_path_in`] applies inside one data directory:
+/// `observability.db` beside the named file.
+#[must_use]
+pub fn observability_db_beside(security_db: &Path) -> PathBuf {
+    security_db
+        .parent()
+        .unwrap_or(security_db)
+        .join("observability.db")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +99,25 @@ mod tests {
         assert_eq!(
             observability_db_path_in(dir).expect("valid stream"),
             dir.join("observability.db")
+        );
+    }
+
+    #[test]
+    fn the_sibling_rule_matches_the_data_directory_rule() {
+        let data_dir = Path::new("/var/lib/agent-sec");
+        let security_db = data_dir.join("security-events.db");
+        assert_eq!(
+            observability_db_beside(&security_db),
+            observability_db_path_in(data_dir).expect("valid stream"),
+            "beside(security db) and in(data dir) must name the same file"
+        );
+    }
+
+    #[test]
+    fn a_parentless_security_db_still_yields_a_sibling() {
+        assert_eq!(
+            observability_db_beside(Path::new("security-events.db")),
+            Path::new("observability.db")
         );
     }
 }

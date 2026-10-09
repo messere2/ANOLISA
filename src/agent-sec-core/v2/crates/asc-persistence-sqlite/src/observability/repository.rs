@@ -57,7 +57,7 @@ pub struct EpochWindow {
 
 impl EpochWindow {
     /// Appends the window's clauses to `clauses` and its values to `params`.
-    fn apply(self, clauses: &mut Vec<String>, params: &mut Vec<SqlValue>) {
+    pub(super) fn apply(self, clauses: &mut Vec<String>, params: &mut Vec<SqlValue>) {
         if let Some(start) = self.start_epoch {
             params.push(SqlValue::Real(start));
             clauses.push(format!("observed_at_epoch >= ?{}", params.len()));
@@ -80,7 +80,7 @@ pub struct Page {
 
 impl Page {
     /// Renders the clause, using `LIMIT -1` when only an offset is set.
-    fn render(self) -> String {
+    pub(super) fn render(self) -> String {
         match (self.limit, self.offset) {
             (None, 0) => String::new(),
             (None, offset) => format!(" LIMIT -1 OFFSET {offset}"),
@@ -91,7 +91,7 @@ impl Page {
 }
 
 /// The columns [`ObservabilityEventRow`] reads, in table order.
-const SELECT_COLUMNS: &str = "id, hook, observed_at, observed_at_epoch, session_id, run_id, \
+pub(super) const SELECT_COLUMNS: &str = "id, hook, observed_at, observed_at_epoch, session_id, run_id, \
                               metrics_json, metadata_json, call_id, tool_call_id";
 
 /// Reads and writes observability records.
@@ -385,7 +385,7 @@ fn count_of(row: &Row<'_>, index: usize) -> Result<u64, KernelError> {
 /// Falls back `user_input` → `prompt` → `None`, and truncates to
 /// [`USER_INPUT_PREVIEW_LIMIT`]. Unparseable JSON yields `None` so the UI can
 /// render a placeholder instead of failing the whole list.
-fn extract_user_input_preview(metrics_json: &str) -> Option<String> {
+pub(super) fn extract_user_input_preview(metrics_json: &str) -> Option<String> {
     let Ok(Value::Object(metrics)) = serde_json::from_str::<Value>(metrics_json) else {
         return None;
     };

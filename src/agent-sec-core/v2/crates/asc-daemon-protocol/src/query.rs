@@ -1,13 +1,13 @@
 //! Read-only query request parameters.
 //!
-//! These are the untrusted wire values of the `sec.*` query family. The v1
-//! daemon served the same methods from one flat parameter dictionary, so the
-//! field names here are v1's wire names (`snake_case`) rather than the
-//! `camelCase` this protocol uses for its own newer families — a v1 dashboard
-//! or script must keep working against the v2 daemon unchanged.
+//! These are the untrusted wire values of the `sec.*` and `obs.*` query
+//! families. The v1 daemon served the same methods from one flat parameter
+//! dictionary, so the field names here are v1's wire names (`snake_case`)
+//! rather than the `camelCase` this protocol uses for its own newer families —
+//! a v1 dashboard or script must keep working against the v2 daemon unchanged.
 //!
-//! Owner identity is deliberately absent: the scope comes from the
-//! kernel-authenticated peer, never from these values.
+//! Owner identity is deliberately absent from both families: the scope comes
+//! from the kernel-authenticated peer, never from these values.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +58,106 @@ pub struct SecQueryParams {
     pub latest_limit: Option<u64>,
     /// Group field of `sec.events.count_by`; required by that method.
     pub group_by: Option<String>,
+}
+
+/// Parameters of the `obs.*` query family.
+///
+/// One struct serves all three methods, exactly as v1's observability
+/// handlers all read from the same parameter dictionary: `obs.runs.list`
+/// requires `session_id`, `obs.timeline.get` requires `session_id` and
+/// `run_id`, and the handler enforces those per-method rules after decoding.
+/// The time-range fields carry v1's dual spelling: ISO strings for the
+/// security-event counts and epoch bounds for the observability rows, both
+/// derived from the same request values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObsQueryParams {
+    /// Exact `session_id`; required by `obs.runs.list` and `obs.timeline.get`.
+    pub session_id: Option<String>,
+    /// Exact `run_id`; required by `obs.timeline.get`.
+    pub run_id: Option<String>,
+    /// Inclusive lower bound, ISO-8601; mutually exclusive with `start_ns`.
+    pub since: Option<String>,
+    /// Exclusive upper bound, ISO-8601; mutually exclusive with `end_ns`.
+    pub until: Option<String>,
+    /// Inclusive lower bound as epoch nanoseconds.
+    pub start_ns: Option<u64>,
+    /// Exclusive upper bound as epoch nanoseconds.
+    pub end_ns: Option<u64>,
+    /// Page size; defaults to 100 for the lists and 1000 for the timeline.
+    pub limit: Option<u64>,
+    /// Page offset; defaults to 0.
+    pub offset: Option<u64>,
+    /// Whether `obs.timeline.get` items include correlated security events.
+    pub include_security: Option<bool>,
+}
+
+#[cfg(test)]
+mod obs_params_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_object_decodes_with_all_defaults() {
+        let params: ObsQueryParams =
+            serde_json::from_value(serde_json::json!({})).expect("empty params decode");
+        assert_eq!(params, ObsQueryParams::default());
+    }
+
+    #[test]
+    fn v1_field_names_decode_verbatim() {
+        let params: ObsQueryParams = serde_json::from_value(serde_json::json!({
+            "session_id": "s-1",
+            "run_id": "r-1",
+            "since": "2026-01-01T00:00:00+00:00",
+            "until": "2026-01-02T00:00:00+00:00",
+            "limit": 20,
+            "offset": 40,
+            "include_security": false,
+            "start_ns": 1,
+            "end_ns": 2,
+        }))
+        .expect("v1 wire names decode");
+        assert_eq!(params.session_id.as_deref(), Some("s-1"));
+        assert_eq!(params.run_id.as_deref(), Some("r-1"));
+        assert_eq!(params.limit, Some(20));
+        assert_eq!(params.include_security, Some(false));
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        let decoded = serde_json::from_value::<ObsQueryParams>(serde_json::json!({
+            "session_id": "s",
+            "ownerUid": 0,
+        }));
+        assert!(
+            decoded.is_err(),
+            "a caller must not be able to name a scope"
+        );
+    }
+
+    #[test]
+    fn sec_family_fields_do_not_leak_into_the_obs_family() {
+        let decoded = serde_json::from_value::<ObsQueryParams>(serde_json::json!({
+            "session_id": "s",
+            "group_by": "category",
+        }));
+        assert!(
+            decoded.is_err(),
+            "the obs dictionary is v1's observability dictionary, not the security one"
+        );
+    }
+
+    #[test]
+    fn non_integer_pagination_is_rejected_at_decode() {
+        let decoded = serde_json::from_value::<ObsQueryParams>(serde_json::json!({
+            "limit": true,
+        }));
+        assert!(decoded.is_err(), "booleans are not integers");
+        let decoded = serde_json::from_value::<ObsQueryParams>(serde_json::json!({
+            "offset": -5,
+        }));
+        assert!(decoded.is_err(), "negative integers are not unsigned");
+    }
 }
 
 #[cfg(test)]

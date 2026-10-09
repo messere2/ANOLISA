@@ -28,7 +28,7 @@ pub use pap::{
     CreateBindingParams, CreatePolicyParams, CreateScopeParams, UpdateBindingParams,
     UpdatePolicyParams, UpdateScopeParams,
 };
-pub use query::SecQueryParams;
+pub use query::{ObsQueryParams, SecQueryParams};
 pub use response::{
     DaemonError, DaemonResponse, ErrorCode, ErrorResponse, MAX_DAEMON_ERROR_MESSAGE_BYTES,
     RequestId, SuccessResponse, error_code,

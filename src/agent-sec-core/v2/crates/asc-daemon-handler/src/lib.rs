@@ -9,7 +9,9 @@
 #![forbid(unsafe_code)]
 
 mod action;
+mod correlation;
 mod dispatcher;
+mod observability_query;
 mod pap;
 mod pii;
 mod prompt_scan;
@@ -17,6 +19,13 @@ mod query;
 mod rejection;
 mod skill_sec;
 
+pub use correlation::{
+    CorrelatedSecurityEvent, CorrelationCandidates, FALLBACK_TIME_WINDOW_SECONDS, MatchReason,
+    ObservabilityRecordFields, SecurityCorrelationService, ZERO_RUN_ID,
+};
 pub use dispatcher::DaemonDispatcher;
+pub use observability_query::{
+    ObservabilityQueries, ObservabilityQueryHandler, SqliteObservabilityQuerySource,
+};
 pub use query::{SecurityEventQueries, SecurityQueryHandler, SqliteEventQuerySource};
 pub use rejection::JsonRejectionEncoder;

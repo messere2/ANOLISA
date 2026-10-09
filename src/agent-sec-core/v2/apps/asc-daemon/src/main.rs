@@ -111,15 +111,16 @@ async fn run(
             return (ExitCode::FAILURE, None);
         }
     };
-    let (finalizer, event_sinks, query_source) = match event_finalizer(telemetry) {
-        Ok(sinks) => sinks,
-        Err(error) => {
-            telemetry.report(&format!(
-                "agent-sec-daemon: security event storage unavailable: {error}"
-            ));
-            return (ExitCode::FAILURE, None);
-        }
-    };
+    let (finalizer, event_sinks, query_source, observability_source) =
+        match event_finalizer(telemetry) {
+            Ok(sinks) => sinks,
+            Err(error) => {
+                telemetry.report(&format!(
+                    "agent-sec-daemon: security event storage unavailable: {error}"
+                ));
+                return (ExitCode::FAILURE, None);
+            }
+        };
     let skill_worker = Arc::new(asc_daemon::SkillWorker::default());
     let skillfs = match prepare_skillfs(skillfs_config, &skill_worker) {
         Ok(bridge) => bridge,
@@ -156,6 +157,9 @@ async fn run(
     let mut dispatcher = DaemonDispatcher::new(pap, policy_for_handler, actions);
     if let Some(source) = query_source {
         dispatcher = dispatcher.with_security_queries(source);
+    }
+    if let Some(source) = observability_source {
+        dispatcher = dispatcher.with_observability_queries(source);
     }
     let dispatcher = Arc::new(asc_daemon::skillfs::SkillFsDispatcher::new(
         dispatcher,
@@ -279,6 +283,7 @@ fn event_finalizer(
         Finalizer,
         Arc<ConfiguredSecurityEventSinks>,
         Option<asc_daemon_handler::SqliteEventQuerySource>,
+        Option<asc_daemon_handler::SqliteObservabilityQuerySource>,
     ),
     asc_event_sink::SinkError,
 > {
@@ -304,6 +309,21 @@ fn event_finalizer(
             ));
         })
         .ok();
+    // The `obs.*` family reads the system observability store beside the
+    // security-event database — the store the state migrator fills — plus
+    // the security-event database itself for the per-session counts and the
+    // timeline correlation. The reader never creates or converges anything,
+    // so a daemon started before the first migration serves empty results
+    // rather than an implicit migration (#6605, #6608).
+    let observability_path = asc_observability::config::observability_db_beside(&sqlite_path);
+    let observability_source =
+        asc_daemon_handler::SqliteObservabilityQuerySource::new(&observability_path, &sqlite_path)
+            .map_err(|error| {
+                telemetry.report(&format!(
+                    "agent-sec-daemon: warning: observability queries unavailable: {error}"
+                ));
+            })
+            .ok();
     Ok((
         Finalizer::new(
             Arc::new(EventSinkAdapter::new(Arc::clone(&sinks))),
@@ -316,6 +336,7 @@ fn event_finalizer(
         ),
         sinks,
         query_source,
+        observability_source,
     ))
 }
 

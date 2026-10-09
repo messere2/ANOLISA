@@ -9,6 +9,7 @@ use asc_daemon_protocol::{DaemonRequest, DaemonResponse, RequestId, error_code};
 use asc_daemon_service::{DispatchError, DispatchRequest, RequestDispatcher, ResponseDisposition};
 
 use crate::action::CodeScanHandler;
+use crate::observability_query::ObservabilityQueryHandler;
 use crate::pap::PapHandler;
 use crate::pii::PiiScanHandler;
 use crate::prompt_scan::PromptScanHandler;
@@ -22,6 +23,7 @@ pub struct DaemonDispatcher {
     skill_sec: crate::skill_sec::SkillSecHandler,
     prompt_scan: PromptScanHandler,
     queries: SecurityQueryHandler,
+    obs_queries: ObservabilityQueryHandler,
     principal_policy: Arc<dyn PrincipalPolicy>,
 }
 
@@ -29,10 +31,12 @@ impl DaemonDispatcher {
     /// Composes PAP dispatch with trusted server authorization policy.
     ///
     /// The role is process-owned configuration. It is never decoded from the
-    /// request or inferred from caller-supplied attribution. The `sec.*`
-    /// query family starts unbound and rejects every call until
-    /// [`Self::with_security_queries`] binds a store, so a composition root
-    /// cannot accidentally serve queries from a wrong database.
+    /// request or inferred from caller-supplied attribution. Both query
+    /// families start unbound and reject every call until
+    /// [`Self::with_security_queries`] and
+    /// [`Self::with_observability_queries`] bind their stores, so a
+    /// composition root cannot accidentally serve queries from a wrong
+    /// database.
     pub fn new(
         application: impl PolicyAdministration + 'static,
         principal_policy: Arc<dyn PrincipalPolicy>,
@@ -45,6 +49,7 @@ impl DaemonDispatcher {
             skill_sec: crate::skill_sec::SkillSecHandler::new(Arc::clone(&actions)),
             prompt_scan: PromptScanHandler::new(actions),
             queries: SecurityQueryHandler::unconfigured(),
+            obs_queries: ObservabilityQueryHandler::unconfigured(),
             principal_policy,
         }
     }
@@ -56,6 +61,16 @@ impl DaemonDispatcher {
         source: impl crate::query::SecurityEventQueries + 'static,
     ) -> Self {
         self.queries = SecurityQueryHandler::new(source);
+        self
+    }
+
+    /// Binds the `obs.*` query family to one observability query source.
+    #[must_use]
+    pub fn with_observability_queries(
+        mut self,
+        source: impl crate::observability_query::ObservabilityQueries + 'static,
+    ) -> Self {
+        self.obs_queries = ObservabilityQueryHandler::new(source);
         self
     }
 
@@ -122,6 +137,10 @@ impl DaemonDispatcher {
             }
             MethodId::Query(method) => {
                 self.queries
+                    .handle(request_id, &principal, method, request.params)
+            }
+            MethodId::ObsQuery(method) => {
+                self.obs_queries
                     .handle(request_id, &principal, method, request.params)
             }
             MethodId::Action(method) => match method {
