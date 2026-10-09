@@ -2592,3 +2592,87 @@ fn html_extraction_is_env_gated_and_recovers_the_original_page() {
         assert_eq!(retrieved.stdout, html.as_bytes());
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Fatal errors must keep their exit code on an unwritable stderr
+// ─────────────────────────────────────────────────────────────────────
+// The exit status is the machine-readable verdict; the `Error:` body is
+// the detail. `eprintln!` panics when writing to stderr fails (a full
+// filesystem behind redirected logs, a pipe whose reader left), which
+// replaced the documented codes with the panic status 101. The
+// healthy-stderr halves of these contracts are pinned by
+// compress_exit_contract_rejects_v1_and_operation_failures; this section
+// pins the same codes when stderr takes no bytes.
+
+/// A fatal error reported to a stderr that cannot take the bytes keeps
+/// the command's exit code: rejected input keeps 2 and an operation
+/// failure keeps 1, neither replaced by the `eprintln!` panic's 101.
+#[test]
+#[cfg(target_os = "linux")]
+fn fatal_errors_keep_their_exit_codes_on_an_unwritable_stderr() {
+    let Some(full) = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .ok()
+    else {
+        eprintln!("skipping: /dev/full is not available on this host");
+        return;
+    };
+
+    // A v1 envelope is rejected before any store is touched: exit 2.
+    let v1 = r#"{"protocol_version":1,"content":"x","agent_id":"a","seam":"post_tool"}"#;
+    let output = tokenless_bin()
+        .args(["compress"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(
+            full.try_clone().expect("dup /dev/full"),
+        ))
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            child.stdin.take().unwrap().write_all(v1.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rejected input must keep exit 2 when stderr takes no bytes"
+    );
+
+    // An unauthorized retrieve under an unusable data dir fails the stash
+    // open: exit 1.
+    let unauthorized = serde_json::json!({
+        "protocol_version": 2,
+        "operation": "retrieve",
+        "attribution": {"agent_id": "integration-agent"},
+        "input": {
+            "hash_or_marker": "0123456789abcdef01234567",
+            "visible_markers": []
+        }
+    });
+    let output = tokenless_bin()
+        .env("TOKENLESS_DATA_DIR", "relative/data")
+        .env("TOKENLESS_STATS_ENABLED", "0")
+        .args(["compress"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(full))
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(unauthorized.to_string().as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an operation failure must keep exit 1 when stderr takes no bytes"
+    );
+}

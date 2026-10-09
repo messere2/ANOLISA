@@ -1311,9 +1311,24 @@ fn record_compression_stats(
     }
 }
 
+/// Report a fatal error on stderr without losing the exit code.
+///
+/// The body is the detail; the exit status is the machine-readable
+/// verdict, and `run()` already chose it (2 for rejected input, 1 for
+/// everything else). A failed write here must not replace that status:
+/// `eprintln!` panics on a write error (a full filesystem behind a
+/// redirected log, a pipe whose reader left) and answered 101 instead
+/// of the command's code. Write errors are discarded: there is no
+/// fallback channel, and the status is the contract to keep.
+fn print_fatal_error(message: &str) {
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_fmt(format_args!("Error: {message}\n"));
+    let _ = stderr.flush();
+}
+
 fn main() {
     if let Err((msg, code)) = run() {
-        eprintln!("Error: {msg}");
+        print_fatal_error(&msg);
         process::exit(code);
     }
 }
