@@ -2592,3 +2592,255 @@ fn html_extraction_is_env_gated_and_recovers_the_original_page() {
         assert_eq!(retrieved.stdout, html.as_bytes());
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Fail-soft CLI notices must survive an unwritable stderr (fd 2 → /dev/full)
+// ─────────────────────────────────────────────────────────────────────
+// `eprintln!` panics when writing to stderr fails (a full filesystem
+// behind redirected logs, a closed descriptor). The CLI's own notices —
+// no-savings and dry-run mode, rejected override paths, the TOON
+// minimum gate, and the schema library's rollback warning — are emitted
+// on paths where the command still succeeds, so they must discard their
+// own write errors exactly like the library helpers established for the
+// stats warnings (114fb26ca) and the stats/ccr fail-soft sites (#6813).
+
+/// Open /dev/full for a child's stderr: every write fails with ENOSPC,
+/// the production shape of "stderr cannot be written".
+#[cfg(target_os = "linux")]
+fn dev_full() -> std::fs::File {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full")
+}
+
+/// A schema that compresses: the long description truncates to a marker
+/// plus recovery instruction, well below the original length.
+#[cfg(target_os = "linux")]
+fn compressible_schema() -> String {
+    let description = "word ".repeat(120);
+    format!(r#"{{"name":"read","description":"{description}","parameters":{{"type":"object"}}}}"#)
+}
+
+/// A schema whose compression expands: the description is long enough to
+/// truncate (a stash row is written when a store is attached) but the
+/// truncated text plus the recovery suffix is longer than the original,
+/// so the run ends in no-savings and rolls the written row back.
+#[cfg(target_os = "linux")]
+fn expanding_schema() -> String {
+    let description = "w ".repeat(110);
+    format!(r#"{{"name":"read","description":"{description}","parameters":{{"type":"object"}}}}"#)
+}
+
+/// Run the CLI with `input` on stdin, stdout captured, and stderr on
+/// /dev/full: every stderr write fails with ENOSPC.
+#[cfg(target_os = "linux")]
+fn run_with_stderr_on_dev_full(command: &mut Command, input: &str) -> std::process::Output {
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(dev_full()))
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(input.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap()
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn schema_no_savings_notice_survives_an_unwritable_stderr() {
+    let Some(fixture) = TempDataDir::new() else {
+        return;
+    };
+    let schema = r#"{"name":"read","description":"short","parameters":{"type":"object"}}"#;
+    let output = run_with_stderr_on_dev_full(
+        fixture
+            .command()
+            .env("TOKENLESS_COMPRESSION_ENABLED", "1")
+            .env("TOKENLESS_STATS_ENABLED", "0")
+            .env("TOKENLESS_SLS_ENABLED", "0")
+            .args(["compress-schema", "--no-stash"]),
+        schema,
+    );
+    assert!(
+        output.status.success(),
+        "the schema no-savings notice must not kill the command (exit {})",
+        output.status.code().unwrap_or(-1)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim_end(), schema);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn dry_run_notices_survive_an_unwritable_stderr() {
+    let Some(fixture) = TempDataDir::new() else {
+        return;
+    };
+    let response = r#"{"value":1}"#;
+    let output = run_with_stderr_on_dev_full(
+        fixture
+            .command()
+            .env("TOKENLESS_COMPRESSION_ENABLED", "0")
+            .env("TOKENLESS_STATS_ENABLED", "0")
+            .env("TOKENLESS_SLS_ENABLED", "0")
+            .args(["compress-response", "--no-stash"]),
+        response,
+    );
+    assert!(
+        output.status.success(),
+        "the no-savings and dry-run notices must not kill the command (exit {})",
+        output.status.code().unwrap_or(-1)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim_end(),
+        response
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn rejected_stats_db_warning_survives_an_unwritable_stderr() {
+    let Some(fixture) = TempDataDir::new() else {
+        return;
+    };
+    // /etc is outside both trust roots (the passwd-backed home and the
+    // selected data directory), so the override is rejected with a
+    // warning and the stats fall back to the data directory.
+    let schema = r#"{"name":"read","description":"short","parameters":{"type":"object"}}"#;
+    let output = run_with_stderr_on_dev_full(
+        fixture
+            .command()
+            .env("TOKENLESS_COMPRESSION_ENABLED", "1")
+            .env("TOKENLESS_STATS_ENABLED", "1")
+            .env("TOKENLESS_SLS_ENABLED", "0")
+            .env("TOKENLESS_STATS_DB", "/etc/tokenless-cli-rejected.db")
+            .args(["compress-schema", "--no-stash"]),
+        schema,
+    );
+    assert!(
+        output.status.success(),
+        "rejecting TOKENLESS_STATS_DB must not kill the compression (exit {})",
+        output.status.code().unwrap_or(-1)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim_end(), schema);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn rejected_stash_db_warning_survives_an_unwritable_stderr() {
+    let Some(fixture) = TempDataDir::new() else {
+        return;
+    };
+    // The rejected override warns and falls back to the data-directory
+    // stash, so the compression still runs with a working store.
+    let output = run_with_stderr_on_dev_full(
+        fixture
+            .command()
+            .env("TOKENLESS_COMPRESSION_ENABLED", "1")
+            .env("TOKENLESS_STATS_ENABLED", "0")
+            .env("TOKENLESS_SLS_ENABLED", "0")
+            .args(["compress-schema"])
+            .arg("--stash-db")
+            .arg("/etc/tokenless-cli-rejected.db"),
+        &compressible_schema(),
+    );
+    assert!(
+        output.status.success(),
+        "rejecting --stash-db must not kill the compression (exit {})",
+        output.status.code().unwrap_or(-1)
+    );
+    let compressed = String::from_utf8(output.stdout).unwrap();
+    assert!(compressed.contains("tokenless retrieve"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn toon_passthrough_notice_survives_an_unwritable_stderr() {
+    let Some(fixture) = TempDataDir::new() else {
+        return;
+    };
+    let payload = r#"{"a":1}"#;
+    let output = run_with_stderr_on_dev_full(
+        fixture
+            .command()
+            .env("TOKENLESS_COMPRESSION_ENABLED", "1")
+            .env("TOKENLESS_STATS_ENABLED", "0")
+            .env("TOKENLESS_SLS_ENABLED", "0")
+            .args(["compress-toon"]),
+        payload,
+    );
+    assert!(
+        output.status.success(),
+        "the TOON minimum notice must not kill the command (exit {})",
+        output.status.code().unwrap_or(-1)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim_end(),
+        payload
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn schema_rollback_delete_warning_survives_an_unwritable_stderr() {
+    let Some(fixture) = TempDataDir::new() else {
+        return;
+    };
+    std::fs::create_dir_all(&fixture.data_dir).unwrap();
+    // A real stash table whose rows cannot be deleted (a BEFORE DELETE
+    // trigger that aborts): the store opens and INSERTs cleanly, but the
+    // no-savings rollback of the written row fails, warning on stderr
+    // (schema_compressor's rollback path) while the command still emits
+    // the original schema.
+    let stash_db = fixture.data_dir.join("blocked-rollback.db");
+    let conn = rusqlite::Connection::open(&stash_db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE stash (
+             hash TEXT PRIMARY KEY,
+             payload TEXT NOT NULL,
+             expires_at INTEGER NOT NULL,
+             generation INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE stash_metadata(
+             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+             last_generation INTEGER NOT NULL CHECK(last_generation >= 0));
+         CREATE TRIGGER block_rollback_delete BEFORE DELETE ON stash
+         BEGIN SELECT RAISE(ABORT, 'rollback delete blocked'); END;
+         INSERT INTO stash_metadata(singleton, last_generation) VALUES (1, 0);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let schema = expanding_schema();
+    let output = run_with_stderr_on_dev_full(
+        fixture
+            .command()
+            .env("TOKENLESS_COMPRESSION_ENABLED", "1")
+            .env("TOKENLESS_STATS_ENABLED", "0")
+            .env("TOKENLESS_SLS_ENABLED", "0")
+            .args(["compress-schema"])
+            .arg("--stash-db")
+            .arg(&stash_db),
+        &schema,
+    );
+    assert!(
+        output.status.success(),
+        "the rollback delete warning must not kill the command (exit {})",
+        output.status.code().unwrap_or(-1)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim_end(), schema);
+    // The warning path really ran: the truncated description's row was
+    // written (INSERT succeeded) and survived because the rollback
+    // DELETE was blocked by the trigger.
+    let conn = rusqlite::Connection::open(&stash_db).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM stash", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 1,
+        "the blocked rollback delete must leave the written row in the store"
+    );
+}

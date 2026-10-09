@@ -15,6 +15,21 @@ fn char_index(s: &str, n: usize) -> usize {
     s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
 }
 
+/// Best-effort stderr warning whose own write failure cannot fail the
+/// command. `eprintln!` panics when writing to stderr fails (a full
+/// filesystem behind redirected logs, a closed descriptor), which would
+/// turn a fail-soft rollback warning into a process failure — the stash
+/// layer must stay invisible to the compression results. The write errors
+/// are discarded: there is no fallback channel to report a failed warning
+/// on, and failing the command here is exactly the regression to avoid.
+fn warn_soft(message: &str) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr();
+    let _ = stderr.write_all(message.as_bytes());
+    let _ = stderr.write_all(b"\n");
+    let _ = stderr.flush();
+}
+
 /// SchemaCompressor compresses OpenAI Function Calling schema
 /// by truncating descriptions, removing titles/examples, and applying
 /// smart compression to reduce token usage.
@@ -178,7 +193,9 @@ impl SchemaCompressor {
                 Ok(false) => {}
                 Err(e) => {
                     self.record_stash_error();
-                    eprintln!("[tokenless] stash: rollback delete failed for key {key}: {e}");
+                    warn_soft(&format!(
+                        "[tokenless] stash: rollback delete failed for key {key}: {e}"
+                    ));
                 }
             }
         }
