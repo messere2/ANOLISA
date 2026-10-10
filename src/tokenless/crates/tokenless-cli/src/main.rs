@@ -465,6 +465,43 @@ fn warn_stats(message: &str) {
     let _ = stderr.flush();
 }
 
+/// Print one line of a command's stdout output, treating a closed stdout
+/// pipe as a graceful stop instead of a panic.
+///
+/// `println!` panics when the write fails, so a command whose successful
+/// output hit an unwritable stdout (`tokenless compress-schema … >
+/// /dev/full`, or a consumer that closed the pipe early) aborted with
+/// "failed printing to stdout" and exit 101 — replacing the exit code the
+/// command had already earned. A consumer that stopped reading is a
+/// pipeline condition, not a crash: the work is done by the time the
+/// output is rendered, so the command finishes normally. A write error
+/// that is NOT a broken pipe (a full disk behind a redirect) is a real
+/// failure — the output is the command's product — and surfaces as an
+/// operation failure (exit 1) through the same `Result` every command
+/// returns, exactly like the byte-exact `compress-toon` writer and the
+/// sibling ktuner CLI's `write_stdout`.
+fn write_stdout(line: &str) -> Result<(), (String, i32)> {
+    write_stdout_raw(&format!("{line}\n"))
+}
+
+/// Write to stdout without appending a newline (the interactive
+/// confirmation prompt). See [`write_stdout`] for the broken-pipe policy.
+fn write_stdout_raw(text: &str) -> Result<(), (String, i32)> {
+    let mut stdout = io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Ok(()) => Ok(()),
+        // A consumer that closed the pipe (… | head -1) is a pipeline
+        // condition: the work is done, the command finishes normally.
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        // Any other write failure (a full disk behind a redirect) means the
+        // product never reached the caller: an operation failure.
+        Err(e) => Err((format!("Failed to write output: {e}"), 1)),
+    }
+}
+
 /// Resolve the stash database path under a trusted state root.
 ///
 /// File-level overrides may reside beneath the passwd-backed home or the
@@ -611,7 +648,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             }
 
             let response_json = outcome.response.to_json().map_err(|e| (e.to_string(), 1))?;
-            println!("{response_json}");
+            write_stdout(&response_json)?;
 
             record_compression(
                 &request.attribution,
@@ -694,7 +731,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
             } else {
                 input.clone()
             };
-            println!("{emit_text}");
+            write_stdout(&emit_text)?;
 
             record_compression_stats(
                 &config,
@@ -785,7 +822,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
 
             let mode = resolve_mode(compression_on, result.before_tokens, result.after_tokens);
             let output_text = stats_after_text(&result, &input);
-            println!("{}", result.output);
+            write_stdout(&result.output)?;
 
             record_compression_stats(
                 &config,
@@ -855,9 +892,9 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                         warn_mode_mismatch("baseline", &baseline, CompressionMode::DryRun);
                         warn_mode_mismatch("tokenless", &tokenless, CompressionMode::Active);
                         if json {
-                            println!("{}", format_compare_json(&baseline, &tokenless));
+                            write_stdout(&format_compare_json(&baseline, &tokenless))?;
                         } else {
-                            println!("{}", format_compare(&baseline, &tokenless));
+                            write_stdout(&format_compare(&baseline, &tokenless))?;
                         }
                         return Ok(());
                     }
@@ -868,20 +905,18 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                         .retrieve_totals()
                         .map_err(|e| (format!("Failed to query retrieve events: {e}"), 1))?;
                     if json {
-                        println!(
-                            "{}",
-                            tokenless_stats::format_summary_json(&records, None, Some(&retrieve))
-                        );
+                        write_stdout(&tokenless_stats::format_summary_json(
+                            &records,
+                            None,
+                            Some(&retrieve),
+                        ))?;
                     } else {
-                        println!(
-                            "{}",
-                            format_summary(
-                                &records,
-                                Some("Tokenless Statistics Summary"),
-                                None,
-                                Some(&retrieve)
-                            )
-                        );
+                        write_stdout(&format_summary(
+                            &records,
+                            Some("Tokenless Statistics Summary"),
+                            None,
+                            Some(&retrieve),
+                        ))?;
                     }
                 }
                 StatsCommands::List { limit } => {
@@ -889,7 +924,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     let records = recorder
                         .all_records(Some(limit))
                         .map_err(|e| (format!("Failed to query records: {e}"), 1))?;
-                    println!("{}", format_list(&records, limit));
+                    write_stdout(&format_list(&records, limit))?;
                 }
                 StatsCommands::Show { id } => {
                     let recorder = open_recorder()?;
@@ -897,7 +932,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                         .record_by_id(id)
                         .map_err(|e| (format!("Failed to query record: {e}"), 1))?
                         .ok_or_else(|| (format!("Record not found: {id}"), 1))?;
-                    println!("{}", format_show(&record));
+                    write_stdout(&format_show(&record))?;
                 }
                 StatsCommands::Diff {
                     id,
@@ -950,33 +985,32 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     if json {
                         let output = serde_json::to_string_pretty(&report)
                             .map_err(|e| (format!("Failed to serialize diff report: {e}"), 1))?;
-                        println!("{output}");
+                        write_stdout(&output)?;
                     } else {
                         let color = !no_color
                             && std::env::var_os("NO_COLOR").is_none()
                             && io::stdout().is_terminal();
-                        println!("{}", format_diff_report(&report, color));
+                        write_stdout(&format_diff_report(&report, color))?;
                     }
                 }
                 StatsCommands::Clear { yes } => {
                     let recorder = open_recorder()?;
                     if !yes {
-                        print!("Are you sure you want to clear all statistics? [y/N] ");
-                        let _ = io::stdout().flush();
+                        write_stdout_raw("Are you sure you want to clear all statistics? [y/N] ")?;
                         let mut input = String::new();
                         if io::stdin().read_line(&mut input).unwrap_or(0) == 0 {
-                            println!("Cancelled.");
+                            write_stdout("Cancelled.")?;
                             return Ok(());
                         }
                         if !input.trim().eq_ignore_ascii_case("y") {
-                            println!("Cancelled.");
+                            write_stdout("Cancelled.")?;
                             return Ok(());
                         }
                     }
                     recorder
                         .clear()
                         .map_err(|e| (format!("Failed to clear: {e}"), 1))?;
-                    println!("Statistics cleared.");
+                    write_stdout("Statistics cleared.")?;
                 }
                 StatsCommands::Status => {
                     let stats_env_set = std::env::var("TOKENLESS_STATS_ENABLED")
@@ -1000,7 +1034,9 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     } else {
                         "default"
                     };
-                    println!("Stats recording: {stats_state} (via {stats_source})");
+                    write_stdout(&format!(
+                        "Stats recording: {stats_state} (via {stats_source})"
+                    ))?;
 
                     let sls_state = if config.is_sls_enabled() {
                         "ENABLED"
@@ -1014,15 +1050,15 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                     } else {
                         "default"
                     };
-                    println!("SLS recording:   {sls_state} (via {sls_source})");
+                    write_stdout(&format!("SLS recording:   {sls_state} (via {sls_source})"))?;
                 }
                 StatsCommands::Enable => {
                     persist_stats_enabled(true)?;
-                    println!("Stats recording enabled.");
+                    write_stdout("Stats recording enabled.")?;
                 }
                 StatsCommands::Disable => {
                     persist_stats_enabled(false)?;
-                    println!("Stats recording disabled.");
+                    write_stdout("Stats recording disabled.")?;
                 }
             }
         }
@@ -1114,7 +1150,7 @@ fn run_command(command: Commands) -> Result<(), (String, i32)> {
                 .map_err(|e| (format!("Serialization error: {e}"), 2))?;
             let output = output.trim_end().to_string();
             if !output.is_empty() {
-                println!("{output}");
+                write_stdout(&output)?;
             }
         }
         Commands::EnvCheck {

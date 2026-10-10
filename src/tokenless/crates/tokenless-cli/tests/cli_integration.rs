@@ -2592,3 +2592,46 @@ fn html_extraction_is_env_gated_and_recovers_the_original_page() {
         assert_eq!(retrieved.stdout, html.as_bytes());
     }
 }
+
+/// A command whose successful output cannot reach stdout must report the
+/// failure through its exit code, not panic. `println!` panics on a write
+/// error, so `tokenless compress-schema … >/dev/full` exited 101 —
+/// replacing the 0 the successful compression had earned — and printed a
+/// panic message on stderr instead of honoring the CLI's error contract.
+#[test]
+fn compress_schema_reports_a_stdout_write_failure_instead_of_panicking() {
+    if !std::path::Path::new("/dev/full").exists() {
+        return;
+    }
+    let fixture = match TempDataDir::new() {
+        Some(fixture) => fixture,
+        None => return,
+    };
+    let schema_path = fixture.root.join("schema.json");
+    std::fs::write(
+        &schema_path,
+        r#"{"type":"function","function":{"name":"get_weather","description":"Look up the weather forecast for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}"#,
+    )
+    .unwrap();
+    let dev_full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = fixture
+        .command()
+        .args(["compress-schema", "--no-stash"])
+        .arg("--file")
+        .arg(&schema_path)
+        .stdout(std::process::Stdio::from(dev_full))
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an undeliverable product is an operation failure, not a panic"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Failed to write output"),
+        "the failure must surface through the CLI's error contract, not a panic message"
+    );
+}
