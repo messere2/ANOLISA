@@ -676,6 +676,37 @@ mod tests {
     use crate::probes::sslsniff::SslEvent;
     use std::rc::Rc;
 
+    #[test]
+    fn test_gemini_view_messages_count_real_user_messages() {
+        // The pending path derives its crash-fallback session/conversation
+        // buckets from `first_user_text`/`last_user_text` and
+        // `user_message_count`, all of which read `content` through
+        // `extract_message_text`. A Gemini request recognized by the shared
+        // view but returned verbatim (`parts`, not `content`) counted zero
+        // user turns and no user text for every call — all Gemini calls of a
+        // process hashed into one synthetic crash bucket regardless of the
+        // actual query.
+        let body = serde_json::json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "first question"}]},
+                {"role": "model", "parts": [{"text": "answer"}]},
+                {"role": "user", "parts": [{"text": "second question"}]}
+            ]
+        });
+        let (messages, _) = crate::parser::llm::extract_messages_view(&body).unwrap();
+        assert_eq!(
+            GenAIBuilder::count_real_user_messages_from_json(&messages),
+            2,
+            "both Gemini user turns must count as real user messages"
+        );
+        let first_user_text = messages
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .find_map(GenAIBuilder::extract_message_text)
+            .unwrap_or_default();
+        assert_eq!(first_user_text, "first question");
+    }
+
     fn make_request(path: &str, body: &str) -> ParsedRequest {
         let buf = body.as_bytes().to_vec();
         let ssl_event = Rc::new(SslEvent {

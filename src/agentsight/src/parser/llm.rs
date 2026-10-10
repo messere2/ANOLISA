@@ -85,6 +85,10 @@ fn is_gemini_generation_path(path: &str) -> bool {
 ///   request.
 /// - DashScope/Bailian native protocol: top-level `"input"` **object**
 ///   wrapping a `"messages"` array.
+/// - Gemini v1beta: top-level `"contents"`, each mapped onto the canonical
+///   `{role, content}` shape (text parts joined with `"\n"`, the `model`
+///   role renamed `assistant`) so the `content`-reading consumers below
+///   see the request like any other protocol.
 ///
 /// Returns `(messages_vec, instructions_text)` where `instructions_text`
 /// is the system-prompt fallback used when the messages array has no
@@ -93,6 +97,7 @@ fn is_gemini_generation_path(path: &str) -> bool {
 /// - Anthropic Messages API: the top-level `"system"` field (string or
 ///   array of `{"type":"text","text":"..."}` blocks), since Anthropic
 ///   carries the system prompt outside the messages array.
+/// - Gemini v1beta: the joined `systemInstruction.parts[].text`.
 ///
 /// The native protocol needs no fallback: its system prompt lives inside
 /// `input.messages`.
@@ -105,6 +110,11 @@ pub fn extract_messages_view(body: &Value) -> Option<(Vec<Value>, Option<String>
     // a `role` and a `parts` array) and their system prompt as
     // `systemInstruction.parts[].text`. Without this arm a drained Gemini
     // call's `input_tokens` stays NULL because no other shape matches.
+    // Each content is mapped onto the canonical `{role, content}` shape every
+    // consumer of this view reads: user-query extraction, user-message
+    // counting, the typed request parse, and the chat templates all look for
+    // `content`, which a raw Gemini content does not carry (its text sits in
+    // `parts`, and its assistant role is spelled `model`).
     if let Some(arr) = body.get("contents").and_then(|c| c.as_array()) {
         let system_text = body
             .get("systemInstruction")
@@ -118,7 +128,30 @@ pub fn extract_messages_view(body: &Value) -> Option<(Vec<Value>, Option<String>
                     .join("\n")
             })
             .filter(|s| !s.is_empty());
-        return Some((arr.clone(), system_text));
+        let messages = arr
+            .iter()
+            .map(|content| {
+                let role = match content.get("role").and_then(|r| r.as_str()) {
+                    Some("model") => "assistant",
+                    Some(other) => other,
+                    None => "user",
+                };
+                let text = content
+                    .get("parts")
+                    .and_then(|p| p.as_array())
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                            .filter(|t| !t.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                serde_json::json!({"role": role, "content": text})
+            })
+            .collect::<Vec<_>>();
+        return Some((messages, system_text));
     }
     if let Some(input) = body.get("input") {
         if let Some(arr) = input.as_array() {
@@ -559,5 +592,37 @@ mod tests {
         let (msgs, instructions) = extract_messages_view(&body).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(instructions, None);
+    }
+
+    #[test]
+    fn test_extract_messages_view_gemini_contents_map_onto_content() {
+        // The Gemini arm must return messages in the canonical `{role, content}`
+        // shape every consumer of this view reads: user-query extraction,
+        // user-message counting, the typed request parse, and the chat
+        // templates all look for `content`. Handing back the raw `contents`
+        // array left every one of them blind — a Gemini content carries its
+        // text in `parts` and spells the assistant role `model`.
+        let body = serde_json::json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "Hello"}, {"text": "again"}]},
+                {"role": "model", "parts": [{"text": "Hi there"}]},
+                {"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": "…"}}]}
+            ],
+            "systemInstruction": {"parts": [{"text": "Be concise"}]}
+        });
+        let (msgs, instructions) = extract_messages_view(&body).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"].as_str(), Some("Hello\nagain"));
+        assert_eq!(
+            msgs[1]["role"], "assistant",
+            "Gemini spells the assistant role `model`"
+        );
+        assert_eq!(msgs[1]["content"].as_str(), Some("Hi there"));
+        // A turn whose parts carry no text still maps to an empty content
+        // instead of a message the readers cannot see at all.
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"].as_str(), Some(""));
+        assert_eq!(instructions.as_deref(), Some("Be concise"));
     }
 }

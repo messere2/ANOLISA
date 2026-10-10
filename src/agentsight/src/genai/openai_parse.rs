@@ -1655,6 +1655,45 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_request_body_gemini_contents() {
+        // A Gemini request routed through the shared view must arrive as
+        // typed messages carrying text parts. The view returned the raw
+        // `contents` array (text in `parts`, assistant spelled `model`), so
+        // every Gemini message parsed with an empty `parts` list — the typed
+        // request, and with it the user query and the session/conversation
+        // key material, stayed empty for every Gemini call.
+        let body = r#"{
+            "contents": [
+                {"role": "user", "parts": [{"text": "Hello"}]},
+                {"role": "model", "parts": [{"text": "Hi there"}]}
+            ],
+            "systemInstruction": {"parts": [{"text": "Be concise"}]}
+        }"#;
+        let req = GenAIBuilder::parse_request_body(body).unwrap();
+        assert_eq!(
+            req.messages.len(),
+            3,
+            "the joined systemInstruction prepends a system message"
+        );
+        assert_eq!(req.messages[0].role, "system");
+        assert!(
+            matches!(&req.messages[0].parts[0], MessagePart::Text { content } if content == "Be concise")
+        );
+        assert_eq!(req.messages[1].role, "user");
+        assert!(
+            !req.messages[1].parts.is_empty(),
+            "the user turn must carry its text"
+        );
+        assert!(
+            matches!(&req.messages[1].parts[0], MessagePart::Text { content } if content == "Hello")
+        );
+        assert_eq!(req.messages[2].role, "assistant");
+        assert!(
+            matches!(&req.messages[2].parts[0], MessagePart::Text { content } if content == "Hi there")
+        );
+    }
+
+    #[test]
     fn test_parse_request_body_skips_missing_role() {
         let body = r#"{
             "model": "gpt-4",
