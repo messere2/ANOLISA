@@ -239,6 +239,11 @@ impl SqliteStore {
                 if raise_on_error {
                     return Err(err);
                 }
+                if matches!(err, KernelError::UnsafePath { .. }) {
+                    tracing::warn!(target: "asc_process_diagnostic",
+                        "{} refusing unsafe database path: {err}", self.log_prefix);
+                    return Ok(None);
+                }
                 if self.read_only || !is_corruption(&err) {
                     tracing::warn!(target: "asc_process_diagnostic", "{} schema init failure: {err}", self.log_prefix);
                     return Ok(None);
@@ -269,6 +274,21 @@ impl SqliteStore {
         let force = inner.force_schema_convergence;
         if !self.read_only {
             self.ensure_write_parent()?;
+            // The writable open is gated like the read-only identity check:
+            // a symlink, FIFO or device node standing in for the database
+            // is refused before `SQLite` opens it. Without the gate the open
+            // follows a symlink (the daemon appends to the link target, and
+            // the post-open `set_permissions` tightens the *target's* mode),
+            // creates the target of a dangling link, and reports a FIFO as a
+            // disk I/O error while every write is silently dropped. A
+            // legitimate rename replacement is still a regular file and
+            // keeps opening. The check covers the corruption-rebuild retry
+            // too, because that path re-enters here.
+            if matches!(path_identity(&self.path), PathIdentity::Unsafe) {
+                return Err(KernelError::UnsafePath {
+                    path: self.path.clone(),
+                });
+            }
         }
 
         let conn = open_connection(&self.path, self.read_only)?;
@@ -431,7 +451,7 @@ fn dispose_inner(inner: &mut Inner) {
 mod tests {
     use super::*;
     use crate::schema::{ColumnSpec, IndexSpec};
-    use std::os::unix::fs::{MetadataExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use tempfile::TempDir;
 
     const WIDGETS: &[TableSpec] = &[TableSpec {
@@ -618,6 +638,33 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_present_before_construction_is_refused_too() {
+        // Normalization resolves the longest existing prefix, and v1 followed
+        // that rule for the final component as well: a link planted *before*
+        // the store was built used to be redirected to its target at
+        // `SqliteStore::new`, where no identity gate could see it. The
+        // normalization now preserves the final link, so the read-only gate
+        // refuses it exactly like a post-construction swap.
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("widgets.db");
+        let target = dir.path().join("elsewhere.db");
+        seed_with_label(&target, "foreign");
+        symlink(&target, &path).expect("plant the symlink before construction");
+
+        let reader = store_at(&path, true);
+        assert_eq!(
+            read_label(&reader, false),
+            None,
+            "a link planted before construction must not be resolved and served"
+        );
+        let raised = reader.with_connection(true, |_| Ok(()));
+        assert!(
+            matches!(raised, Err(KernelError::UnsafePath { .. })),
+            "the gate must see the named path, got {raised:?}"
+        );
+    }
+
+    #[test]
     fn a_dangling_symlink_is_unsafe_not_absent() {
         // `lstat` sees the dangling link itself, so it is reported as an
         // unsafe path rather than the pre-first-write "absent" state.
@@ -670,6 +717,156 @@ mod tests {
         );
         let joined = opened.join();
         assert!(joined.is_ok(), "the worker thread must finish");
+    }
+
+    fn all_labels(path: &Path) -> Vec<String> {
+        store_at(path, true)
+            .with_connection(true, |conn| {
+                let mut stmt = conn.prepare("SELECT label FROM widgets ORDER BY id")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .expect("read")
+            .expect("rows")
+    }
+
+    #[test]
+    fn a_writable_store_does_not_write_through_a_symlinked_path() {
+        // The read-only identity check refuses a swapped symlink; the
+        // writable open must not write *through* one either. Following the
+        // link appends the daemon rows to an arbitrary target, and the
+        // post-open `set_permissions` tightens the target mode through
+        // the link.
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("widgets.db");
+        let target = dir.path().join("elsewhere.db");
+        seed_with_label(&target, "foreign");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+            .expect("widen the target mode");
+        symlink(&target, &path).expect("plant the symlink");
+
+        let writer = store_at(&path, false);
+        let outcome = writer.with_connection(true, |conn| {
+            conn.execute("INSERT INTO widgets (id, label) VALUES ('b', 'own')", [])?;
+            Ok(())
+        });
+        assert!(
+            matches!(outcome, Err(KernelError::UnsafePath { .. })),
+            "a raising writer must refuse the unsafe path, got {outcome:?}"
+        );
+        assert_eq!(
+            all_labels(&target),
+            vec!["foreign".to_owned()],
+            "the link target must stay untouched"
+        );
+        let mode = fs::metadata(&target).expect("target").mode() & 0o7777;
+        assert_eq!(
+            mode, 0o644,
+            "the target mode must not be tightened through the link"
+        );
+    }
+
+    #[test]
+    fn a_degraded_writer_drops_the_write_instead_of_following_the_link() {
+        // The fire-and-forget sink shape (`raise_on_error = false`) degrades
+        // the same way the read-only gate does: no error, no write through
+        // the link, the store simply stays closed.
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("widgets.db");
+        let target = dir.path().join("elsewhere.db");
+        seed_with_label(&target, "foreign");
+        symlink(&target, &path).expect("plant the symlink");
+
+        let writer = store_at(&path, false);
+        let outcome = writer.with_connection(false, |conn| {
+            conn.execute("INSERT INTO widgets (id, label) VALUES ('b', 'own')", [])?;
+            Ok(())
+        });
+        assert!(
+            matches!(outcome, Ok(None)),
+            "the degraded shape stays fail-closed, got {outcome:?}"
+        );
+        assert_eq!(
+            all_labels(&target),
+            vec!["foreign".to_owned()],
+            "no row may be written through the link"
+        );
+    }
+
+    #[test]
+    fn a_dangling_symlink_is_not_created_through() {
+        // `SQLite` creates a missing database on open, so without the gate a
+        // dangling link materializes its target as this process user.
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("widgets.db");
+        let target = dir.path().join("nowhere.db");
+        symlink(&target, &path).expect("dangling symlink");
+
+        let writer = store_at(&path, false);
+        let outcome = writer.with_connection(true, |_| Ok(()));
+        assert!(
+            matches!(outcome, Err(KernelError::UnsafePath { .. })),
+            "a dangling link must not be created through, got {outcome:?}"
+        );
+        assert!(!target.exists(), "the link target must not be created");
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("link")
+                .file_type()
+                .is_symlink(),
+            "the link itself stays as the caller left it"
+        );
+    }
+
+    #[test]
+    fn a_fifo_at_the_database_path_is_refused_before_opening() {
+        // A FIFO does not hang a writable open (`SQLite` opens read-write,
+        // which does not block on a FIFO), but the open degenerates into a
+        // misleading disk I/O error while every write is silently dropped.
+        // The gate names the actual problem instead.
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("widgets.db");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Mode::from_bits(0o600).expect("mode"),
+        )
+        .expect("fifo");
+
+        let writer = store_at(&path, false);
+        let outcome = writer.with_connection(true, |_| Ok(()));
+        assert!(
+            matches!(outcome, Err(KernelError::UnsafePath { .. })),
+            "a FIFO must not be opened as a database, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_writable_store_reopens_when_the_file_is_replaced_by_a_rename() {
+        // The gate only refuses non-regular entries: a legitimate replace
+        // (a new inode, still a regular file) keeps opening and writable.
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("widgets.db");
+        seed_with_label(&path, "first");
+
+        let replacement = dir.path().join("replacement.db");
+        seed_with_label(&replacement, "second");
+        fs::remove_file(&path).expect("move the original aside");
+        fs::rename(&replacement, &path).expect("swap in the replacement");
+
+        let writer = store_at(&path, false);
+        writer
+            .with_connection(true, |conn| {
+                conn.execute("INSERT INTO widgets (id, label) VALUES ('b', 'own')", [])?;
+                Ok(())
+            })
+            .expect("write")
+            .expect("value");
+        assert_eq!(
+            all_labels(&path),
+            vec!["second".to_owned(), "own".to_owned()],
+            "a renamed-in regular file must be written to, not refused"
+        );
     }
 
     #[test]
