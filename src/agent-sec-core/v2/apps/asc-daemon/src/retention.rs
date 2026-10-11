@@ -449,6 +449,39 @@ async fn sleep_or_cancel(cancelled: &mut watch::Receiver<bool>, delay: Duration)
     }
 }
 
+/// Combines the security and observability retention outcomes into the one
+/// the retention task schedules around.
+///
+/// A failure or contention in either store must schedule the failure retry:
+/// re-running the other store's pass is safe because its gate independently
+/// decides whether anything is due, so a store whose pass already ran (or was
+/// not due) contributes a no-op re-check. `Ran` outranks `NotDue` so the
+/// completion report fires when either store did work.
+pub fn combine_outcomes(
+    security: MaintenanceOutcome,
+    observability: MaintenanceOutcome,
+) -> MaintenanceOutcome {
+    match (security, observability) {
+        (
+            MaintenanceOutcome::Failed(security_error),
+            MaintenanceOutcome::Failed(observability_error),
+        ) => MaintenanceOutcome::Failed(format!(
+            "security store: {security_error}; observability store: {observability_error}"
+        )),
+        (MaintenanceOutcome::Failed(error), _) => {
+            MaintenanceOutcome::Failed(format!("security store: {error}"))
+        }
+        (_, MaintenanceOutcome::Failed(error)) => {
+            MaintenanceOutcome::Failed(format!("observability store: {error}"))
+        }
+        (MaintenanceOutcome::Contended, _) | (_, MaintenanceOutcome::Contended) => {
+            MaintenanceOutcome::Contended
+        }
+        (MaintenanceOutcome::Ran, _) | (_, MaintenanceOutcome::Ran) => MaintenanceOutcome::Ran,
+        (MaintenanceOutcome::NotDue, MaintenanceOutcome::NotDue) => MaintenanceOutcome::NotDue,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as ChannelMutex;
@@ -680,5 +713,42 @@ mod tests {
         );
 
         release_tx.send(()).expect("unblock the detached pass");
+    }
+
+    #[test]
+    fn combining_outcomes_prioritizes_failures_and_contention() {
+        assert_eq!(
+            combine_outcomes(
+                MaintenanceOutcome::Ran,
+                MaintenanceOutcome::Failed("x".into())
+            ),
+            MaintenanceOutcome::Failed("observability store: x".into())
+        );
+        assert_eq!(
+            combine_outcomes(
+                MaintenanceOutcome::Failed("y".into()),
+                MaintenanceOutcome::Ran
+            ),
+            MaintenanceOutcome::Failed("security store: y".into())
+        );
+        assert_eq!(
+            combine_outcomes(
+                MaintenanceOutcome::Failed("a".into()),
+                MaintenanceOutcome::Failed("b".into())
+            ),
+            MaintenanceOutcome::Failed("security store: a; observability store: b".into())
+        );
+        assert_eq!(
+            combine_outcomes(MaintenanceOutcome::NotDue, MaintenanceOutcome::Contended),
+            MaintenanceOutcome::Contended
+        );
+        assert_eq!(
+            combine_outcomes(MaintenanceOutcome::Ran, MaintenanceOutcome::NotDue),
+            MaintenanceOutcome::Ran
+        );
+        assert_eq!(
+            combine_outcomes(MaintenanceOutcome::NotDue, MaintenanceOutcome::NotDue),
+            MaintenanceOutcome::NotDue
+        );
     }
 }

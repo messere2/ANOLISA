@@ -249,8 +249,13 @@ async fn run(
     // prune a large historical backlog, and request audit writes share the
     // same connection mutex (see `retention` module docs and
     // `DAEMON_JOB_CONTRACT_zh.md` section 11.5).
-    let (retention_task, admitted) =
-        start_retention(&durable_sinks.security, telemetry, shutdown.clone()).await;
+    let (retention_task, admitted) = start_retention(
+        &durable_sinks.security,
+        &durable_sinks.observability,
+        telemetry,
+        shutdown.clone(),
+    )
+    .await;
     let result = if admitted {
         Some(
             serve(
@@ -327,13 +332,22 @@ async fn run(
 /// Returns the task handle plus whether `serve` may admit requests; see
 /// [`asc_daemon::retention::start_with_shutdown`].
 async fn start_retention(
-    sinks: &Arc<ConfiguredSecurityEventSinks>,
+    security: &Arc<ConfiguredSecurityEventSinks>,
+    observability: &Arc<asc_event_sink::ConfiguredObservabilitySinks>,
     telemetry: &asc_observability::TelemetryRuntime,
     shutdown: ShutdownToken,
 ) -> (RetentionTask, bool) {
     let pass: RetentionPass = {
-        let sinks = Arc::clone(sinks);
-        Arc::new(move |now| sinks.run_sqlite_retention(now))
+        let security = Arc::clone(security);
+        let observability = Arc::clone(observability);
+        Arc::new(move |now| {
+            // Both gated passes run under one task: each store keeps its own
+            // marker and lock, and the combined outcome schedules the failure
+            // retry when either store needs it.
+            let security_outcome = security.run_sqlite_retention(now);
+            let observability_outcome = observability.run_sqlite_retention(now);
+            asc_daemon::retention::combine_outcomes(security_outcome, observability_outcome)
+        })
     };
     let report: RetentionReport = {
         let reporter = telemetry.reporter();
@@ -501,6 +515,15 @@ fn event_finalizer(
     if let Err(error) = sinks.warm_jsonl() {
         telemetry.report(&format!(
             "agent-sec-daemon: warning: JSONL security event log unavailable: {error}"
+        ));
+    }
+    // The observability store joins the retention lifecycle, so it must be
+    // open before the startup catch-up runs; a failed warm is only a warning
+    // - the observability stream is best-effort and warms again on the next
+    // record.
+    if let Err(error) = observability_sinks.warm_sqlite() {
+        telemetry.report(&format!(
+            "agent-sec-daemon: warning: observability sqlite unavailable: {error}"
         ));
     }
     // The `sec.*` query family reads the same database the writers use. If

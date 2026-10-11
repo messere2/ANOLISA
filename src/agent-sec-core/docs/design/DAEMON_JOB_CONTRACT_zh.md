@@ -512,6 +512,11 @@ periodic scheduler 或完整 JobSupervisor。目的：让长驻 daemon 自持 Se
 retention（#6602/#6679）——v1 依赖短命 CLI 进程 `atexit` 补做维护，长驻 daemon 永不裁剪，
 SIGKILL/OOM/掉电后重启也不补做，数据库在长期运行的主机上无界增长。
 
+同一服务自 2026-10 起也承载 Observability `SQLite` 的周期 retention：两库各有独立
+gate marker/lock，同一 pass 内组合执行；任一库 `Failed`/`Contended` 即按 `failure_retry`
+重试（另一库的 gate 重查为无害 no-op），observability 库的 warm 失败仅为告警（best-effort
+流），不阻塞 admission。
+
 - **trigger**：启动 catch-up 一次（`retention::run_startup_catchup`，在 UDS admission 之前
   完成），此后每 `check_interval`（默认 1h）重查共享跨进程 daily gate；gate 本身仍决定是否
   真正执行。pass 内部失败按 `failure_retry`（默认 60s）退避重试。catch-up 与 shutdown 信号
