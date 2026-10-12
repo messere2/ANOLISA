@@ -55,6 +55,12 @@ pub const DEFAULT_NOTIFY_DEBOUNCE_MS: u64 = 300;
 /// `paths: []` to signal "whole skill may have changed".
 pub const MAX_NOTIFY_PATHS: usize = 64;
 
+/// Maximum serialized notify request the daemon's authenticated session
+/// reads as one frame. The daemon bounds session frames at 64 KiB including
+/// the LF delimiter; a larger request is closed without any response, so the
+/// notify falls back to the whole-skill signal instead of retrying forever.
+const NOTIFY_REQUEST_FRAME_BYTES: usize = 64 * 1024 - 1;
+
 /// Maximum response body size (bytes) accepted from the daemon.
 /// Responses exceeding this limit are rejected as `InvalidResponse`
 /// to prevent unbounded memory allocation on a malicious/buggy peer.
@@ -1949,6 +1955,21 @@ impl NotifyInner {
             paths,
             self.timeout_ms,
         );
+        // The daemon's authenticated session reads at most one 64 KiB frame
+        // per request; a larger serialized notify is closed without any
+        // response (the v1 daemon accepted it with a 4 MiB budget). Falling
+        // back to the whole-skill signal keeps the notification deliverable,
+        // exactly like a batch that exceeds MAX_NOTIFY_PATHS.
+        let event = match serde_json::to_vec(&event) {
+            Ok(bytes) if bytes.len() <= NOTIFY_REQUEST_FRAME_BYTES => event,
+            _ => NotifyChangeEvent::new(
+                canonical_skill_dir.clone(),
+                state.skill_id.clone(),
+                state.event_kind,
+                Vec::new(),
+                self.timeout_ms,
+            ),
+        };
 
         self.attempted.fetch_add(1, Ordering::Relaxed);
         let (outcome, business_request_not_sent) = match self.client.send(&event) {
@@ -4748,5 +4769,40 @@ mod public_endpoint_tests {
             validate_authenticated_notify_endpoint(&alias.path().join("linked-parent/daemon.sock"))
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod notify_request_budget_tests {
+    use super::*;
+
+    #[test]
+    fn controller_falls_back_to_whole_skill_when_the_request_exceeds_the_daemon_session_frame() {
+        let client = Arc::new(InMemoryNotifyClient::new());
+        let ctrl = NotifyController::new(
+            client.clone(),
+            "/srv/skills",
+            Duration::from_millis(50),
+            5000,
+        );
+        // Sixteen deep relative paths — each below the daemon's 4 KiB
+        // per-path validation bound and within MAX_NOTIFY_PATHS — serialize
+        // past the daemon session's 64 KiB frame read bound (the v1 daemon
+        // accepted the same request with a 4 MiB budget).
+        for i in 0..16 {
+            ctrl.observe(
+                "alpha",
+                Some(Path::new(&format!("{:02}/{}", i, "a".repeat(4090)))),
+                MutationKind::Write,
+            );
+        }
+        ctrl.flush_for_testing();
+        let events = client.events();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].paths.is_empty(),
+            "a request that cannot fit one daemon session frame must fall back to the whole-skill signal"
+        );
+        ctrl.shutdown();
     }
 }
