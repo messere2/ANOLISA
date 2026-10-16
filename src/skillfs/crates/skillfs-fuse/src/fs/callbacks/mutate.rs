@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use super::super::SkillFs;
 use crate::path::{
     PathType, hermes_nested_sync_eligible, is_hermes_management_path, is_skill_discover_path,
+    top_level_skill_sync_eligible,
 };
 use crate::security::{MutationKind, SkillEvent, SkillEventAction, SkillEventKind};
 use crate::sync::SyncEvent;
@@ -199,7 +200,11 @@ impl SkillFs {
                 // `/skills/<skill>` if the resolver returns
                 // `current` / `fallback`.
                 let placeholder_skill = match &path_type {
-                    PathType::SkillDir { skill_name } => Some(skill_name.clone()),
+                    PathType::SkillDir { skill_name }
+                        if top_level_skill_sync_eligible(skill_name) =>
+                    {
+                        Some(skill_name.clone())
+                    }
                     PathType::InboxSkillDir { skill_name }
                         if Self::is_inbox_skill_name_allowed(skill_name) =>
                     {
@@ -1391,14 +1396,34 @@ impl SkillFs {
                             _ => RenameSourceIdentity::ExactChain(&exact_chain),
                         };
                         if !self.rename_source_backs_store_entry(old_name, identity) {
-                            // Plain (never-activated) directory rename: the
-                            // store holds no entry originating here, so
-                            // leave it untouched — same stance as the
-                            // sentinel-gated inbox activation flow.
-                            info!(
-                                old = %old_name, new = %new_name,
-                                "sync: non-skill dir rename left the store untouched"
-                            );
+                            if is_staging_rename {
+                                // A staging-to-final rename is an install
+                                // transaction: the store never held the
+                                // staging spelling (the loader skips
+                                // dot-prefixed directories and the write
+                                // paths do not adopt them), but a fresh
+                                // scan of the renamed tree holds the final
+                                // skill — adopt it now so the install is
+                                // visible without a remount.
+                                self.update_store_after_skill_rename(
+                                    old_name,
+                                    new_name,
+                                    &new_physical,
+                                );
+                                info!(
+                                    old = %old_name, new = %new_name,
+                                    "sync: staged install adopted on rename"
+                                );
+                            } else {
+                                // Plain (never-activated) directory rename: the
+                                // store holds no entry originating here, so
+                                // leave it untouched — same stance as the
+                                // sentinel-gated inbox activation flow.
+                                info!(
+                                    old = %old_name, new = %new_name,
+                                    "sync: non-skill dir rename left the store untouched"
+                                );
+                            }
                         } else {
                             // Reuse the shared #3999 refresh helper so the
                             // rename keeps its invalid-dirname Degraded
@@ -1415,11 +1440,16 @@ impl SkillFs {
                         // File-level rename inside a skill — trigger re-parse
                         // if SKILL.md is involved.
                         if let PathType::SkillMd { skill_name } = &new_type {
-                            self.send_sync(SyncEvent::Reparse {
-                                skill_name: skill_name.clone(),
-                                source_path: new_physical.clone(),
-                                max_skill_size: self.max_skill_size,
-                            });
+                            // Same loader rule as the write arm: a
+                            // dot-prefixed top-level name never enters the
+                            // store.
+                            if top_level_skill_sync_eligible(skill_name) {
+                                self.send_sync(SyncEvent::Reparse {
+                                    skill_name: skill_name.clone(),
+                                    source_path: new_physical.clone(),
+                                    max_skill_size: self.max_skill_size,
+                                });
+                            }
                         }
                         if let PathType::SkillMd { skill_name } = &old_type {
                             // Ownership gate (the removal-side twin of the

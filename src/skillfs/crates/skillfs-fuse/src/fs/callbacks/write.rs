@@ -10,7 +10,9 @@ use tracing::{debug, warn};
 use super::super::SkillFs;
 use crate::attr::{file_attr_from_metadata, file_attr_from_stat};
 use crate::handles::open_options_from_flags;
-use crate::path::{PathType, hermes_nested_sync_eligible, is_skill_discover_path};
+use crate::path::{
+    PathType, hermes_nested_sync_eligible, is_skill_discover_path, top_level_skill_sync_eligible,
+};
 use crate::security::{MutationKind, SkillEventAction, SkillEventKind};
 use crate::sync::SyncEvent;
 use crate::sys::{errno, fchownat_leaf, fstatat_leaf, openat_leaf, utimensat_leaf};
@@ -265,11 +267,15 @@ impl SkillFs {
                 // so the store needs to re-parse from the same source
                 // file regardless of which namespace the caller used.
                 if let PathType::SkillMd { skill_name } = &path_type {
-                    self.send_sync(SyncEvent::Reparse {
-                        skill_name: skill_name.clone(),
-                        source_path: self.skill_physical_dir(skill_name).join("SKILL.md"),
-                        max_skill_size: self.max_skill_size,
-                    });
+                    // The loader never scans dot-prefixed top-level
+                    // directories, so the store must not adopt them here.
+                    if top_level_skill_sync_eligible(skill_name) {
+                        self.send_sync(SyncEvent::Reparse {
+                            skill_name: skill_name.clone(),
+                            source_path: self.skill_physical_dir(skill_name).join("SKILL.md"),
+                            max_skill_size: self.max_skill_size,
+                        });
+                    }
                 }
                 if let PathType::InboxPassthrough {
                     skill_name,
@@ -688,11 +694,15 @@ impl SkillFs {
                 // store has to learn about the new manifest either
                 // way).
                 if let PathType::SkillMd { skill_name } = &path_type {
-                    self.send_sync(SyncEvent::Reparse {
-                        skill_name: skill_name.clone(),
-                        source_path: physical.clone(),
-                        max_skill_size: self.max_skill_size,
-                    });
+                    // Same loader rule as the write arm: a dot-prefixed
+                    // top-level name never enters the store.
+                    if top_level_skill_sync_eligible(skill_name) {
+                        self.send_sync(SyncEvent::Reparse {
+                            skill_name: skill_name.clone(),
+                            source_path: physical.clone(),
+                            max_skill_size: self.max_skill_size,
+                        });
+                    }
                 }
                 if let PathType::InboxPassthrough {
                     skill_name,
@@ -1441,11 +1451,15 @@ impl SkillFs {
                     }
                     // SKILL.md truncate triggers store reparse
                     if let PathType::SkillMd { ref skill_name } = path_type {
-                        self.send_sync(SyncEvent::Reparse {
-                            skill_name: skill_name.clone(),
-                            source_path: physical.clone(),
-                            max_skill_size: self.max_skill_size,
-                        });
+                        // Same loader rule as the write arm: a dot-prefixed
+                        // top-level name never enters the store.
+                        if top_level_skill_sync_eligible(skill_name) {
+                            self.send_sync(SyncEvent::Reparse {
+                                skill_name: skill_name.clone(),
+                                source_path: physical.clone(),
+                                max_skill_size: self.max_skill_size,
+                            });
+                        }
                     }
                     // Hermes nested SKILL.md truncate re-parses too (the
                     // store keys the leaf entry), hidden working copies

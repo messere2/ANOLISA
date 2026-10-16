@@ -59,6 +59,22 @@ pub fn is_hermes_management_path(name: &str) -> bool {
     HERMES_MANAGEMENT_PATHS.contains(&name)
 }
 
+/// Whether the store's write paths may adopt a top-level skill name: the
+/// mkdir placeholder and the SKILL.md re-parse sends.
+///
+/// The core loader skips dot-prefixed top-level directories (`is_hidden`),
+/// so they are never managed Skills and a fresh scan of the same tree holds
+/// no entry for them. The write paths must apply the same rule — a
+/// dot-prefixed directory reachable for installer I/O (a staging root is
+/// the documented example) must not enter the live store through a mount
+/// edit either, or the store diverges from a re-discovery of the tree and
+/// `skill-discover`, which renders the store directly, advertises the
+/// entry. The Hermes nested re-parse arms apply the same loader rule to
+/// their (category, leaf) components.
+pub fn top_level_skill_sync_eligible(skill_name: &str) -> bool {
+    !skill_name.starts_with('.')
+}
+
 /// Conservatively auto-detect the skill layout for a source root.
 ///
 /// A source is Hermes only when it carries an unambiguous Hermes hub

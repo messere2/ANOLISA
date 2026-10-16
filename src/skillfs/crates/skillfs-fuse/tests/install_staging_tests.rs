@@ -4529,3 +4529,182 @@ fn hermes_root_listing_applies_the_ordinary_view_filters() {
             .is_dir()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The store's write paths mirror the loader's scan rule
+//
+// The core loader skips dot-prefixed directories at every level, so a fresh
+// scan of the same tree never holds an entry for them. The store's write
+// paths (the mkdir placeholder, the SKILL.md re-parse sends and the
+// staging-to-final rename) must apply the same rule: the live store has to
+// stay equivalent to a re-discovery of the tree, and `skill-discover`
+// renders the store directly.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// skill-discover renders the live store directly; read it through the
+/// mount so the assertions run on the consumer-visible surface.
+fn staging_discover_md(fixture: &StagingMountFixture) -> String {
+    std::fs::read_to_string(fixture.skill_path("skill-discover").join("SKILL.md")).unwrap()
+}
+
+/// Wait until the FUSE session is serving the flat `/skills` view. On
+/// slow-spawn hosts the environment-profile probe loop runs for seconds
+/// before the session comes up, and the fixture's fixed grace sleep races
+/// it — the same readiness race the newer fixtures poll through.
+fn wait_skills_dir_served(fixture: &StagingMountFixture) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if std::fs::metadata(fixture.skills_root()).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("mount never served {}", fixture.skills_root().display());
+}
+
+#[test]
+fn staging_root_skillmd_writes_never_enter_the_store() {
+    skip_if_no_fuse!();
+
+    let fixture = StagingMountFixture::new(|src| {
+        create_skill(src, "alpha");
+    });
+    wait_skills_dir_served(&fixture);
+
+    // The installer flow: create the staging root through the mount, then
+    // write — and rewrite — a half-installed manifest inside it. The second
+    // write takes the truncate arm of the same re-parse rule.
+    let staging = fixture.skill_path(".openclaw-install-stage-eps");
+    std::fs::create_dir(&staging).unwrap();
+    std::fs::write(
+        staging.join("SKILL.md"),
+        "---\nname: eps\ndescription: staged half-install\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(
+        staging.join("SKILL.md"),
+        "---\nname: eps\ndescription: staged half-install v2\n---\nbody\n",
+    )
+    .unwrap();
+
+    // The store-sync worker debounces at 50 ms; wait past it before
+    // asserting on the advertised store.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let discover = staging_discover_md(&fixture);
+    assert!(
+        !discover.contains(".openclaw-install-stage-eps"),
+        "a staging root's half-installed manifest must never be advertised \
+         by skill-discover: {discover}"
+    );
+    assert!(
+        discover.contains("alpha"),
+        "the scanned skill stays advertised: {discover}"
+    );
+}
+
+#[test]
+fn dot_prefixed_mkdir_never_enters_the_store() {
+    skip_if_no_fuse!();
+
+    let fixture = StagingMountFixture::new(|src| {
+        create_skill(src, "alpha");
+    });
+    wait_skills_dir_served(&fixture);
+
+    // `.secret-work` matches no staging pattern: it is just a dot-prefixed
+    // directory, the shape the store loader never scans.
+    std::fs::create_dir(fixture.skill_path(".secret-work")).unwrap();
+    // Control: a plain name must still surface immediately — the mkdir
+    // placeholder is the existing install entrance behavior.
+    std::fs::create_dir(fixture.skill_path("brand-new")).unwrap();
+
+    let skills = common::list_dir_names(&fixture.skills_root());
+    assert!(
+        !skills.contains(&".secret-work".to_string()),
+        "a dot-prefixed directory is never a managed skill, but /skills \
+         lists it: {skills:?}"
+    );
+    assert!(
+        skills.contains(&"brand-new".to_string()),
+        "a plain mkdir must still surface immediately: {skills:?}"
+    );
+
+    let discover = staging_discover_md(&fixture);
+    assert!(
+        !discover.contains(".secret-work"),
+        "skill-discover must not list a dot-prefixed directory: {discover}"
+    );
+}
+
+#[test]
+fn disk_seeded_staging_rename_lands_in_the_store() {
+    skip_if_no_fuse!();
+
+    let fixture = StagingMountFixture::new(|src| {
+        create_skill(src, "alpha");
+        // The staging root is seeded on disk (the installer wrote it
+        // directly, not through the mount): the scan skips it, so the store
+        // holds no entry for the staging spelling.
+        create_skill(src, ".openclaw-install-stage-delta");
+    });
+
+    wait_skills_dir_served(&fixture);
+    let staging = fixture.skill_path(".openclaw-install-stage-delta");
+    assert!(staging.join("SKILL.md").is_file());
+    // The install transaction: rename the staging root to its final name
+    // through the mount.
+    std::fs::rename(&staging, fixture.skill_path("delta")).unwrap();
+
+    let skills = common::list_dir_names(&fixture.skills_root());
+    assert!(
+        skills.contains(&"delta".to_string()),
+        "the freshly installed skill must be visible in /skills: {skills:?}"
+    );
+    let discover = staging_discover_md(&fixture);
+    assert!(
+        discover.contains("delta"),
+        "the freshly installed skill must be advertised by skill-discover: \
+         {discover}"
+    );
+    assert!(
+        !discover.contains(".openclaw-install-stage-delta"),
+        "the staging spelling must not survive the rename: {discover}"
+    );
+}
+
+#[test]
+fn mount_staged_install_rename_still_lands_in_the_store() {
+    skip_if_no_fuse!();
+
+    let fixture = StagingMountFixture::new(|src| {
+        create_skill(src, "alpha");
+    });
+    wait_skills_dir_served(&fixture);
+
+    // The full through-the-mount installer transaction: mkdir the staging
+    // root, stage the manifest inside it, rename to the final name.
+    let staging = fixture.skill_path(".openclaw-install-stage-zeta");
+    std::fs::create_dir(&staging).unwrap();
+    std::fs::write(
+        staging.join("SKILL.md"),
+        "---\nname: zeta\ndescription: installed skill\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::rename(&staging, fixture.skill_path("zeta")).unwrap();
+
+    let skills = common::list_dir_names(&fixture.skills_root());
+    assert!(
+        skills.contains(&"zeta".to_string()),
+        "the installed skill must be visible in /skills: {skills:?}"
+    );
+    let discover = staging_discover_md(&fixture);
+    assert!(
+        discover.contains("zeta"),
+        "the installed skill must be advertised by skill-discover: {discover}"
+    );
+    assert!(
+        !discover.contains(".openclaw-install-stage-zeta"),
+        "the staging spelling must not survive the rename: {discover}"
+    );
+}

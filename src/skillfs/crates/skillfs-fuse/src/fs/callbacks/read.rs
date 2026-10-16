@@ -10,7 +10,9 @@ use tracing::{debug, warn};
 use super::super::SkillFs;
 use super::super::read_resolution::ReadResolution;
 use crate::handles::open_options_from_flags;
-use crate::path::{PathType, hermes_nested_sync_eligible, is_skill_discover_path};
+use crate::path::{
+    PathType, hermes_nested_sync_eligible, is_skill_discover_path, top_level_skill_sync_eligible,
+};
 use crate::security::{SkillEventAction, SkillEventKind};
 use crate::sync::SyncEvent;
 use crate::sys::{errno, openat_leaf};
@@ -752,11 +754,15 @@ impl SkillFs {
                     reply.error(errno(&e));
                     return;
                 }
-                self.send_sync(SyncEvent::Reparse {
-                    skill_name: skill_name.clone(),
-                    source_path: physical.clone(),
-                    max_skill_size: self.max_skill_size,
-                });
+                // Same loader rule as the write arm: a dot-prefixed
+                // top-level name never enters the store.
+                if top_level_skill_sync_eligible(skill_name) {
+                    self.send_sync(SyncEvent::Reparse {
+                        skill_name: skill_name.clone(),
+                        source_path: physical.clone(),
+                        max_skill_size: self.max_skill_size,
+                    });
+                }
                 self.observe_mutation(
                     skill_name,
                     Some(Path::new("SKILL.md")),
