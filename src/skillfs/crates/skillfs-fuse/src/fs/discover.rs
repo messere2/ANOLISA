@@ -210,6 +210,14 @@ Use `read_file` on any `source_path` to read the skill and learn how to use it.\
         let mut names: Vec<&str> = store.list();
         names.sort_unstable();
         for name in names {
+            // I2: staging roots must not participate in skill-discover.
+            // A pre-seeded staging category is scanned into the store
+            // under its nested skills' leaf names, so filter on the
+            // entry's staging privacy (name or scanned category), not
+            // the bare leaf alone.
+            if self.store_entry_is_staging_private(name) {
+                continue;
+            }
             if let Some(entry) = store.get(name) {
                 let desc = md_cell(&entry.metadata.description);
                 body.push_str(&format!("| {} | {} |\n", md_cell(name), desc));

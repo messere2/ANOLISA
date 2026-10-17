@@ -335,6 +335,16 @@ impl SkillStore {
         names
     }
 
+    /// The category a skill was discovered under, if any.
+    ///
+    /// Only entries the loaders inserted carry a category record:
+    /// [`SkillStore::upsert`] (the write-path reparse and refresh
+    /// surface) keys purely by the adopted name and keeps no category,
+    /// and [`SkillStore::remove`] drops the record with the entry.
+    pub fn category_of(&self, name: &str) -> Option<&str> {
+        self.skill_categories.get(name).map(String::as_str)
+    }
+
     /// Get the number of skills.
     pub fn len(&self) -> usize {
         self.skills.len()

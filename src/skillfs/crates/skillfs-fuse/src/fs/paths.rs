@@ -332,6 +332,33 @@ impl SkillFs {
         })
     }
 
+    /// I2: whether a store entry is installer-private staging content.
+    ///
+    /// The loader enforces no staging rule of its own — it skips only
+    /// dot-prefixed top-level directories, while the staging validator
+    /// accepts non-dot patterns — so a staging root pre-seeded on disk
+    /// (an installer that stages before the mount, or the residue of a
+    /// crashed install) is scanned in as a category and its nested
+    /// skills enter the store under their bare leaf names. Matching the
+    /// pattern against the leaf alone then lets the staged half-install
+    /// surface in the ordinary views; the entry is staging-private when
+    /// either the adopted name or the category it was scanned under
+    /// names a staging root. Write-path mutations inside a staging root
+    /// never reach the store: the observe dispatcher drops them first
+    /// (H3), so the category record of a scan-loaded entry is the
+    /// authoritative staging signal for the listing surfaces.
+    pub(super) fn store_entry_is_staging_private(&self, name: &str) -> bool {
+        self.staging_matcher.as_ref().is_some_and(|m| {
+            if m.is_staging_root(name) {
+                return true;
+            }
+            let store = self.store.read();
+            store
+                .category_of(name)
+                .is_some_and(|category| m.is_staging_root(category))
+        })
+    }
+
     pub(super) fn is_pending_install(&self, skill_name: &str) -> bool {
         let ctrl = match self.pending_install_controller.as_ref() {
             Some(c) => c,
